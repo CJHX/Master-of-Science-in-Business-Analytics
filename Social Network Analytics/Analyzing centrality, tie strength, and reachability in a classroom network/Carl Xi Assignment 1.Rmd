@@ -1,0 +1,386 @@
+---
+title: "Assignment 1"
+author: "Carl Xi"
+date: "10/22/2019"
+output: html_document
+---
+
+1. First, consider the social and task ties as separate networks.
+(A) Use igraph to generate indegree, outdegree, closeness, betweenness, and PageRank centrality statistics for each individual the social and task networks.
+(B) Compute the correlations of the five centrality measures you generate for the social
+network with the five measures generated for the task network. Which measures in the
+task network are most closely related to those in the socializing network? Name at least
+one insight can you draw from the relationships between these five measures across the
+two networks.
+
+```{r}
+rm(list = ls(all = TRUE))
+library(igraph)
+library(data.table)
+library(expm)
+setwd("C:/Users/carlj/OneDrive/Documents/School-MSBA/Classes/Fall/Social Network Analytics/Assignment 1")
+
+# task 1 -- getting adjacency matrix data into igraph
+hw1data = fread("classroom_social_and_task_network.csv", header = TRUE)
+#describe(hw1data)
+
+# incomplete responses will leave blanks, which we don't want to sum as NAs later
+blanks_to_0s = function(DT) {
+  for (j in seq_len(ncol(DT))){
+    set(DT,which(DT[[j]] == ""),j,0)
+  }
+}
+blanks_to_0s(hw1data) 
+
+#creating two edge list, one for social and one for task
+hw1social_Edge_list <- hw1data[,-4]
+hw1task_Edge_list <- hw1data[,-3]
+
+#renaming weight column to weight
+names(hw1social_Edge_list)[3] <- "weight"
+names(hw1task_Edge_list)[3] <- "weight"
+
+#Creating empty matrixes for social and task
+social_matrix = matrix(0,22,22)
+task_matrix = matrix(0,22,22)
+
+#converting edge lists to matrixes
+for(i in 1:22){
+  for(j in 1:22){
+    index = 22*(i-1)+j
+    social_matrix[i,j] <- hw1data$social_tie[index]
+    task_matrix[i,j] <- hw1data$task_tie[index]
+  }
+}
+
+#creating graphs from the matrixes
+hw1social_graph <-graph.adjacency(social_matrix, mode="directed", weighted=TRUE)
+hw1task_graph <-graph.adjacency(task_matrix, mode="directed", weighted=TRUE)
+
+#simplifying the graphs
+hw1social_graph2 <-simplify(hw1social_graph, remove.multiple=TRUE, remove.loops=TRUE)
+hw1task_graph2 <-simplify(hw1task_graph, remove.multiple=TRUE, remove.loops=TRUE)
+
+#Calculating OutDegree (without weights)
+Social_OutDegree_Unweighted <- degree(hw1social_graph2, mode = "out")
+Task_OutDegree_Unweighted <- degree(hw1task_graph2, mode = "out")
+print("Social_OutDegree (Unweighted)")
+print(Social_OutDegree_Unweighted)
+print("Task_OutDegree (Unweighted)")
+print(Task_OutDegree_Unweighted)
+Social_OutDegree_Unweighted <- as.data.frame(Social_OutDegree_Unweighted)
+Task_OutDegree_Unweighted <- as.data.frame(Task_OutDegree_Unweighted)
+
+#Calculating InDegree (without weights)
+Social_InDegree_Unweighted <- degree(hw1social_graph2, mode = "in")
+Task_InDegree_Unweighted <- degree(hw1task_graph2, mode = "in")
+print("Social_InDegree (Unweighted)")
+print(Social_InDegree_Unweighted)
+print("Task_InDegree (Unweighted)")
+print(Task_InDegree_Unweighted)
+Social_InDegree_Unweighted <- as.data.frame(Social_InDegree_Unweighted)
+Task_InDegree_Unweighted <- as.data.frame(Task_InDegree_Unweighted)
+
+#Calculating OutDegree (with weights)
+Social_OutDegree <- strength(hw1social_graph2, mode = "out")
+Task_OutDegree <- strength(hw1task_graph2, mode = "out")
+print("Social_OutDegree (Weighted)")
+print(Social_OutDegree)
+print("Task_OutDegree (Weighted)")
+print(Task_OutDegree)
+Social_OutDegree <- as.data.frame(Social_OutDegree)
+Task_OutDegree <- as.data.frame(Task_OutDegree)
+
+#Calculating InDegree (with weights)
+Social_InDegree <- strength(hw1social_graph2, mode = "in")
+Task_InDegree <- strength(hw1task_graph2, mode = "in")
+print("Social_InDegree (Weighted)")
+print(Social_InDegree)
+print("Task_InDegree (Weighted)")
+print(Task_InDegree)
+Social_InDegree <- as.data.frame(Social_InDegree)
+Task_InDegree <- as.data.frame(Task_InDegree)
+
+#Calculating Closeness
+Social_Closeness <- closeness(hw1social_graph2, mode = "out")
+Task_Closeness <- closeness(hw1task_graph2, mode = "out")
+print("Social_Closeness")
+print(Social_Closeness)
+print("Task_Closeness")
+print(Task_Closeness)
+Social_Closeness <- as.data.frame(Social_Closeness)
+Task_Closeness <- as.data.frame(Task_Closeness)
+
+#Calculating Betweenness
+Social_Betweenness <- betweenness(hw1social_graph2)
+Task_Betweenness <- betweenness(hw1task_graph2)
+print("Social_Betweenness")
+print(Social_Betweenness)
+print("Task_Betweenness")
+print(Task_Betweenness)
+Social_Betweenness <- as.data.frame(Social_Betweenness)
+Task_Betweenness <- as.data.frame(Task_Betweenness)
+
+#Calculating Page Rank
+Social_Pagerank <- page_rank(hw1social_graph2)
+Task_Pagerank <- page_rank(hw1task_graph2)
+print("Social_Pagerank")
+print(Social_Pagerank$vector)
+print("Task_Pagerank") 
+print(Task_Pagerank$vector)
+Social_Pagerank <- as.data.frame(Social_Pagerank$vector)
+Task_Pagerank <- as.data.frame(Task_Pagerank$vector)
+
+#Testing Correlation
+print(cor(Social_OutDegree_Unweighted, Task_OutDegree_Unweighted))
+print(cor(Social_InDegree_Unweighted, Task_InDegree_Unweighted))
+print(cor(Social_OutDegree, Task_OutDegree))
+print(cor(Social_InDegree, Task_InDegree))
+print(cor(Social_Closeness, Task_Closeness))
+print(cor(Social_Pagerank, Task_Pagerank))
+print(cor(Social_Betweenness, Task_Betweenness))
+
+print("By far, the highest correlated metric between social and task is betweeness. We know that betweenness is a centrality measure that quantifies the number of times a node acts as a bridge along the shortest path between two other nodes, and that it is a good measure of a node's briding and brokerage characteristics, as well as its ability to reach collect diverse information and bridge disconnected groups. Thus, this high correlation suggests that nodes who exhibit high bridging and brokerage characteristics for tasks are also likely to exhibit similar characteristics for social. Likewise, this could also suggest that the layout of the disconnected groups in both the social and task networks are similar.")
+```
+#################################################################################################
+
+2. Next, consider the social and task ties together, as two distinct types of ties comprising one
+network.
+(A) Suppose that a tie is strong if it is above the mean strength for that type, conditional on
+the tie existing - do not include weights of 0 in the calculation of the mean. Under this
+definition, does the network satisfy Strong Triadic Closure? Come up with a solution
+that illustrates this (1) visually, in a plot, as well as (2) programmatically, by giving the
+number or proportion of ties that are violation of Strong Triadic Closure.
+(B) Now suppose that a tie is strong if it is above the median strength for that type,
+conditional on the tie existing. Under this definition, does the network satisfy Strong
+Triadic Closure? What insights does this illustrate about these interactions within the
+network?
+
+```{r}
+#Question 2 Graphs
+
+#Generating mean and medians
+social_tie_mean <- mean(social_matrix[social_matrix>0])
+task_tie_mean <- mean(task_matrix[task_matrix>0])
+social_tie_median <- median(social_matrix[social_matrix>0])
+task_tie_median <- median(task_matrix[task_matrix>0])
+
+#I have also previously used the union function to join the social and task graphs to plot both
+#on the same graph, but decided to simplfy the question by making a graph that only shows whether
+#there is a strong tie between two nodes, and if not if there is a weak tie.
+
+#Creating new matrixes for manipulation
+social_matrix1 <- social_matrix
+task_matrix1 <- task_matrix
+
+#Creating a new matrix that shows the highest ties across the board 
+social_matrix1[social_matrix>social_tie_mean]=1
+social_matrix1[(social_matrix>0)&(social_matrix<social_tie_mean)]=0.1
+task_matrix1[task_matrix>task_tie_mean]=1
+task_matrix1[(task_matrix>0)&(task_matrix<task_tie_mean)]=0.1
+combined_matrix <- social_matrix1+task_matrix1
+combined_matrix <- combined_matrix+t(combined_matrix)
+
+#Creating a combined graph
+combine_Graph <- graph.adjacency(combined_matrix, mode="undirected",weighted = TRUE)
+combine_Graph2<-simplify(combine_Graph)
+
+#plotting combined graph
+ranges = E(combine_Graph2)$weight
+ranges[ranges >0.5] = "purple"
+ranges[(ranges < 1)&(ranges > 0)] = "red"
+plot.igraph(combine_Graph2,layout=layout.fruchterman.reingold, 
+            vertex.label.color="black",edge.color=ranges,vertex.size = 8, edge.arrow.size=.1,edge.curved=FALSE)
+
+#Finding all STC violations based on strong tie as defined by mean 
+Mean_STC_Violations <- 0
+for(i in 1:22){
+  for(j in 1:22){
+    for(x in 1:22){
+      if((social_matrix[i,j] > social_tie_mean | social_matrix[j,i] > social_tie_mean |
+         task_matrix[i,j] > task_tie_mean | task_matrix[j,i] > task_tie_mean) &
+        (social_matrix[i,x] > social_tie_mean | social_matrix[x,i] > social_tie_mean | 
+           task_matrix[i,x] > task_tie_mean | task_matrix[x,i] > task_tie_mean) & 
+        j!=x & x>j){        
+        print(paste(i,"has strong relationships with both",x,"and",j,","))
+        if(social_matrix[j,x]==0 & social_matrix[x,j]==0 &
+           task_matrix[j,x]==0 & task_matrix[x,j]==0){
+          print(paste("but there is no connection between ",x,"and",j,", which violates STC."))
+          Mean_STC_Violations <- Mean_STC_Violations+1
+        }else{
+          print(paste(x,"is connected to",j,", compliant with STC."))
+        }
+      }
+    }
+  }
+}
+print("Mean_STC_Violations")
+print(Mean_STC_Violations)
+#18 Violations
+#####################################################################################
+#Calculating Medians
+
+#Finding all STC violations based on strong tie as defined by median
+Median_STC_Violations <- 0
+for(i in 1:22){
+  for(j in 1:22){
+    for(x in 1:22){
+      if((social_matrix[i,j] > social_tie_median | social_matrix[j,i] > social_tie_median |
+          task_matrix[i,j] > task_tie_median | task_matrix[j,i] > task_tie_median) &
+         (social_matrix[i,x] > social_tie_median | social_matrix[x,i] > social_tie_median | 
+          task_matrix[i,x] > task_tie_median | task_matrix[x,i] > task_tie_median) & 
+         j!=x & x>j){        
+        print(paste(i,"has strong relationships with both",x,"and",j,","))
+        if(social_matrix[j,x]==0 & social_matrix[x,j]==0 &
+           task_matrix[j,x]==0 & task_matrix[x,j]==0){
+          print(paste("but there is no connection between ",x,"and",j,", which violates STC."))
+          Median_STC_Violations <- Median_STC_Violations+1
+        }else{
+          print(paste(x,"is connected to",j,", compliant with STC."))
+        }
+      }
+    }
+  }
+}
+print("Median_STC_Violations")
+print(Median_STC_Violations)
+#78
+
+print("As Strong Triadic Closure (STC) is hard to find visually already, I decided to simply things by only creating a visual plot with the strongest ties between nodes shown. This is enough to determine if any 3-node combinations violate STC. Our network does not satisfy STC because we can immediately find 3-node combinations that violate STC.")
+print("If we define a tie as strong if it is above mean strength (mean calculated without weights of 0s), then the network does NOT satify Strong Triadic Closure (STC) because there are 18 3-node combinations that violate STC (do not have a third edge). ")
+print("If we define a tie as strong if it is above median strength (median calculated without weights of 0s), then the network does NOT satify Strong Triadic Closure (STC) because there are 78 3-node combinations that violate STC (do not have a third edge). ")
+print("The number of STC violations calculated using median is much higher than the number of STC violations calculated using mean. This is likely because the mean is much higher than the median, which means that the system calculated using mean will have not as many strong ties as the system calculated using median. With less strong ties, the mean system will have less chances at causing STC violations, whereas the median system will have a lot more strong ties that will cause STC violations. ")
+```
+#################################################################################################
+3. Continue to treat the social and task ties as two distinct types ties comprising one network.
+
+(A) It is also possible to compute betweenness on the edges in a network, as well as the
+vertices. This is a good measure of the flow of information and resources through a
+network. Calculate the edge-level betweenness for both of the types of tie.
+(B) Does it seem like edges with high betweenness tend to be strong or weak ties, according
+to our two definitions above? Does this result make sense?
+
+```{r}
+#Creating dataframes with head (start node), tail (end node), edge betweenness, weight,
+#and whether the mean and median determins the edge to be a strong (True) or weak (False) tie
+social_edge_betweenness <- edge_betweenness(hw1social_graph2, e = E(hw1social_graph2), directed = TRUE,weights=E(hw1social_graph2)$weight)
+social_edge_betweenness_matrix <- data.matrix(get.edgelist(hw1social_graph2,names=TRUE))
+social_edge_betweenness_matrix <- cbind(social_edge_betweenness_matrix,social_edge_betweenness,E(hw1social_graph2)$weight)
+colnames(social_edge_betweenness_matrix)<- c('Head','Tail','Edge Betweenness','weight')
+rownames(social_edge_betweenness_matrix)<- 1:57
+
+social_edge_betweenness_df <- data.frame(social_edge_betweenness_matrix)
+social_edge_betweenness_df$Mean_Based_Type <- ifelse(as.numeric(as.character(social_edge_betweenness_df$weight)) >=social_tie_mean, TRUE, FALSE)
+social_edge_betweenness_df$Median_Based_Type <- ifelse(as.numeric(as.character(social_edge_betweenness_df$weight)) >=social_tie_median,  TRUE, FALSE)
+social_edge_betweenness_df
+
+task_edge_betweenness <- edge_betweenness(hw1task_graph2, e = E(hw1task_graph2), directed = TRUE,weights=E(hw1task_graph2)$weight)
+task_edge_betweenness_matrix <- data.matrix(get.edgelist(hw1task_graph2,names=TRUE))
+task_edge_betweenness_matrix <- cbind(task_edge_betweenness_matrix,task_edge_betweenness,E(hw1task_graph2)$weight)
+colnames(task_edge_betweenness_matrix)<- c('Head','Tail','Edge Betweenness','weight')
+rownames(task_edge_betweenness_matrix)<- 1:48
+
+task_edge_betweenness_df <- data.frame(task_edge_betweenness_matrix)
+task_edge_betweenness_df$Mean_Based_Type <- ifelse(as.numeric(as.character(task_edge_betweenness_df$weight)) >=task_tie_mean, TRUE, FALSE)
+task_edge_betweenness_df$Median_Based_Type <- ifelse(as.numeric(as.character(task_edge_betweenness_df$weight)) >=task_tie_median, TRUE, FALSE)
+task_edge_betweenness_df
+
+print("We know that betweeness is a good measure of a node's briding and brokerage characteristics, as well as its ability to reach collect diverse information and bridge disconnected groups. From visually inspecting the dataframes, we can see that weak edges (as defined as being below the mean or median) are typically accompanied by high betweenness. This is likely because strong edges are between nodes that are familiar with each other and have similar information, limiting the edge's briding/brokerage effect, as well as getting diverse information from disconnected group. Across both social and task, the median cutoff for strong bond is lower than the mean, meaning that it classified a lot more bonds as strong, when in reality these bonds might just be people who are close but not actually strong. Between social and task, task exhibits a much more drastic decrease in betweeness compared to social. This implies that nodes distribute new social information a lot more openly than task information, and along less strong edges.")
+```
+#################################################################################################
+4. Continue to treat the social and task ties as two distinct types of ties comprising one network.
+How many pairs of nodes do not have walks between one another? Find a solution that
+performs this calculation directly on the matrix - it is possible to verify this solution via
+igraph afterward.
+
+```{r}
+#Since we only care about whether a path exists or not and not how strong it is,
+#we can simply add the two matrixes together. 
+combined_matrixQ4 <- social_matrix+task_matrix
+final_combined_matrix = matrix(0,22,22)
+
+#raising the matrix to the power of 1 to 25 and adding the results together
+#pairs of nodes with no walks will still be 0, and pairs with walks between them will be any
+#arbitrary non-zero number
+for(i in 1:25){
+  final_combined_matrix <- combined_matrixQ4%^%i+final_combined_matrix
+  i <- i+1
+}
+
+#identifying and printing out all node pairs with no walks between them
+no_walk <- 0
+for(i in 1:22){
+  for(j in 1:22){
+    if(final_combined_matrix[i,j] == 0 & j != i){
+      print(paste("There is no path from",j,"to",i,"."))
+      no_walk <- no_walk + 1
+    }
+  }
+}
+print("Total no paths")
+print(no_walk)
+print("These no-walks are directed")
+```
+#################################################################################################
+5. The network-level measure of degree centrality is a good indicator of the dispersion of the
+degree distribution in a network. Generate and plot a network in R in which the network-level
+measure of degree centrality, is equal to 1, and another where it is equal to 0. Would this relationship hold true for these networks for other measures of centrality, such as closeness or betweenness?
+
+```{r}
+#Network with level measure of degree centrality = 0
+graph1 <-  graph.ring(12,directed=FALSE)
+plot(graph1)
+graph1_degree <- degree(graph1)
+graph1_degree  <- as.data.frame(graph1_degree)
+Centrality_0 <-sum(max(graph1_degree)-graph1_degree)/((12-1)*(12-2))
+print("Network Measure of Degree Centrality")
+Centrality_0
+#0
+
+#Network with level measure of degree centrality = 1
+graph2 <-  graph.star(12, mode="undirected")
+plot(graph2)
+graph2_degree <- degree(graph2)
+graph2_degree  <- as.data.frame(graph2_degree)
+Centrality_1 <-sum(max(graph2_degree)-graph2_degree)/((12-1)*(12-2))
+print("Network Measure of Degree Centrality")
+Centrality_1
+#1
+
+#Closeness of network with level measure of degree centrality = 0
+graph1_closeness <- closeness(graph1)
+graph1_closeness  <- as.data.frame(graph1_closeness)
+Closeness_0 <- sum(max(graph1_closeness)-graph1_closeness)/((12-1)*(12-2))
+print("Network Measure of Closeness for centrality = 0")
+print(Closeness_0)
+#0
+
+#Closeness of network with level measure of degree centrality = 1
+graph2_closeness <- closeness(graph2)
+graph2_closeness  <- as.data.frame(graph2_closeness)
+Closeness_1 <- sum(max(graph2_closeness)-graph2_closeness)/((12-1)*(12-2))
+print("Network Measure of Closeness for centrality = 1")
+print(Closeness_1)
+#0.004329004
+
+#Betweenness of network with level measure of degree centrality = 0
+graph1_betweenness <- betweenness(graph1)
+graph1_betweenness  <- as.data.frame(graph1_betweenness)
+Betweenness_0 <- sum(max(graph1_betweenness)-graph1_betweenness)/((12-1)*(12-2))
+print("Network Measure of Betweenness for centrality = 0")
+print(Betweenness_0)
+# 0
+
+#Betweenness of network with level measure of degree centrality = 1
+graph2_betweenness <- betweenness(graph2)
+graph2_betweenness  <- as.data.frame(graph2_betweenness)
+Betweenness_1 <- sum(max(graph2_betweenness)-graph2_betweenness)/((12-1)*(12-2))
+print("Network Measure of Betweenness for centrality = 1")
+print(Betweenness_1)
+#5.5
+
+
+print("Closeness and betweenness continue to be a good indicator of the dispersion of the degree distribution in a network where the network-level measure of degree centrality is 0 (a ring network). In our network with 12 nodes, the closeness and betweenness is 0 and 0 respectively, and all three measures are at the minimum possible value of 0.")
+
+print("Closeness and betweenness continue to be a good indicator of the dispersion of the degree distribution in a network where the network-level measure of degree centrality is 1 (a star network). In our network with 12 nodes, the closeness and betweenness is 0.004329004 and 5.5 respectively, and all three measures are at their maximum possible values (without any normalization).")
+```
