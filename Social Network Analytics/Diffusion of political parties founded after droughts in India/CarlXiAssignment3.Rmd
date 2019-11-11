@@ -1,0 +1,607 @@
+---
+title: "Assignment 3"
+author: "Carl Xi"
+date: "11/4/2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+library(data.table)
+library(igraph)
+library(stringr)
+library(splitstackshape)
+library(plotly)
+library(network)
+library(lubridate)
+library(zoo)
+library(plm)
+library(pglm)
+library(dplyr)
+library(ggplot2)
+library(panelAR)
+
+rm(list = ls(all = TRUE))
+
+setwd("C:/Users/carlj/OneDrive/Documents/School-MSBA/Classes/Fall/Social Network Analytics/Assignment 3")
+
+#Let's first import all the data packages
+DistrictRaw <- fread("district_information.csv", header = TRUE)
+RainRaw <- fread("rain_information.csv", header = TRUE)
+BorderRaw <- fread("border_information.csv", header = TRUE)
+NewPartyRaw <- fread("new_parties_in_each_district_by_candidate.csv", header = TRUE)
+
+#We only care about Rain data between 1951 and 1999, so let's remove the rest
+RainRaw<-RainRaw[RainRaw$year>"1950"& RainRaw$year<"2000",]
+
+#Let's remove all NA variables
+RainRaw$rain[RainRaw$rain == 0] <- NA
+RainRaw <- na.omit(RainRaw)
+
+#Let's remove all NA/Null Variables from New Party as well
+NewPartyRaw <- NewPartyRaw[NewPartyRaw$party_name != ""]
+NewPartyRaw <- na.omit(NewPartyRaw)
+
+#The year 1985 has suspiciously little data. A brief Google search reveals that the previous Prime Minister was assassinated in 1984, and elections didn't occur until 1985. Thus, we will remove 1985 data from district information
+DistrictRaw <- DistrictRaw[DistrictRaw$year != 1985]
+
+#Looking at the Raw Border data, we can see that it is directed. We can make our lives easier for the following questions by simply putting district first instead of focal_district. This will give us information of both columns.
+
+#We create a reversed border dataframe
+BorderRaw2 <- cbind.data.frame(focal_district = BorderRaw$district, district = BorderRaw$focal_district) 
+#We bind the normal and reversed together
+BorderRaw <- rbind.data.frame(BorderRaw, BorderRaw2)
+
+#We remove any duplicates
+BorderRaw <- unique(BorderRaw)
+```
+Question 1: 
+
+First, we will set up the relationship between RainRaw and political party foundings, and then modify the RainRaw measure to generate a statistically independent measure for droughts. This modification will allow us to isolate the effect of economic strain on political parties from other underlying features of a region that might influence its political structure.
+
+(A) Create a figure, for example, a scatter plot, showing the visual relationship between the level of RainRaw in a district in the period leading up to the current election, and the number of political parties that are founded in a region.
+
+You can use the raw RainRaw measure or the Standardized Precipitation Index. You can consider the level of RainRaw for each election period in terms of (1) the sum of the raw RainRaw during the interval starting from the year following the previous election up until the year of the current election or (2) the yearly average of the Standardized Precipitation Index during the interval starting from the year following the previous election up until the year of the current election.
+
+```{r}
+#Let's create a revised version of the rain datatable
+RainAlt <- data.frame()
+
+#We can get all the election years by looking at all the years of the first district
+ElectionYear <- DistrictRaw$year[1:13]
+
+#The outer for loop isolates every district's entire historical data
+for (i in unique(RainRaw$district)) {
+  DistrictSubset <- RainRaw[RainRaw$district == i]
+  x <- 1
+  
+  #The inner for loop loops through every year of the district that's isolated
+  for (j in ElectionYear) {
+    #Creates a copy of rain data
+    RainAlt2 <- RainAlt
+    
+    #We record the district, year, and calculate the average SPI and total amount of rain for that district for each election period
+    RainAlt <- cbind.data.frame(district = i, year = j, DistrictSubset[x:(which(DistrictSubset$year == j)),] %>% summarise(AvgSPI = mean(spi), TotalRain = sum(rain)))
+    
+    #We then bind the data together
+    RainAlt <- rbind.data.frame(RainAlt2, RainAlt)
+   
+    #We then loop this for all districts 
+    x <- 1 + which(DistrictSubset$year == j)
+  }
+}
+
+
+#Time to combine
+#Let's combine the Rain and District datasets
+RainDistrict <- inner_join(DistrictRaw,RainAlt,by=c("district","year"))
+```
+
+```{r}
+#With the district and rain data combined, we can now create our first plot of sum rainfall vs number of parties
+
+ggplot(RainDistrict, aes(y = new_parties, x = TotalRain)) + geom_point() + labs(title ="Rain Intensity vs Number of New Parties", x = "Sum Rainfall", y = "Total New Parties") + theme_minimal()
+```
+```{r}
+#Let's also take a look at average SPIl vs number of parties
+
+ggplot(RainDistrict, aes(y = new_parties, x = AvgSPI)) + geom_point() + labs(title ="Average SPI vs Number of New Parties", x = "Average SPI", y = "Number of New Parties") + theme_minimal()
+```
+
+(B) Using the election-period level rainfall measures created above, show that the raw level of rainfall, as well as the Standardized Precipitation Index, are not independent from one election period to the next within a district, as well as from neighboring districts from one election period to the next.
+
+It is possible to show this relationship by regressing a district’s current level of the rainfall variable on (1) its lagged value and (2) the lagged value of its neighbors’ rainfall variable. For computing the neighbors’ value, you can use an average of each of the surrounding districts’ values. Include a control in the regression for the number of years in the election period, and use a fixed effects specification to control for the time-invariant features of a district as well as a control for each election period. This can be accomplished using the plm package, using a model specified in the form of plm(outcome variable ∼ predictor variables, data, effect = "twoways", model = "within", index = "district"), where "twoways", "within" provide both sets of fixed effects. Create a table, and 2 new columns of the lagged value of rainfull and SPI:
+
+```{r}
+#Let's create a copy of our cleaned rain data for regression purposes
+RainRegress <- RainAlt
+
+#Let's calculate the lag for SPI and Rain then append it to our regression datatable
+RainRegress$SPILag <- append(0,RainRegress$AvgSPI[-length(RainRegress$district)])
+RainRegress$RainLag <- append(0,RainRegress$TotalRain[-length(RainRegress$district)])
+
+#Let's create a new dataframe for storing the lag of the neighbors
+NeighborLag <- data.frame()
+
+#We loop through every unique district
+for (i in unique(RainRegress$district)) {
+  
+  # We find the list of neighbors for each district
+  NeighborList <- as.vector(BorderRaw[which(BorderRaw$focal_district == i),2])
+  
+  #We subset the rain data so that only neighbor data remains
+  #We then group by year, and calculate the average rain and SPI lag of neighbors
+  NeighborLagN <- RainRegress[RainRegress$district %in% NeighborList$district,] %>% group_by(year) %>% summarise(SPILagN = mean(SPILag), RainLagN = mean(RainLag), district = i)
+  
+  #Finally, we bind the data into the dataframe we created above
+  NeighborLag <- rbind.data.frame(NeighborLag,NeighborLagN)
+}
+
+#We can now combine the neighbor lag data into the rain data for regression using inner join
+RainRegress <- inner_join(RainRegress,NeighborLag,by = c("district","year"))
+
+#We create an empty list to store the index of the first election year of every district
+Index1 <- c()
+
+#We loop through every unique district
+for (i in unique(RainRegress$district)) {
+  #We encode the index of the first election year
+  Index2 <- first(which(RainRegress$district == i))
+  #We then append it to our list of indexes
+  Index1 <- append(Index1,Index2)
+}
+
+#Since we are dealing with lag, we need to remove the first year of every district.
+RainRegress <- RainRegress[-Index1,]
+
+#We will also calculate the years between each election year, which we are forced to hardcode year by year. Luckly there isn't too many years. We first encode all intervals as 0 to cover 1951 (The first year), then individually encode each subsequent year
+RainRegress$interval <- 0
+RainRegress[RainRegress$year == 1957,][,'interval'] <- 6
+RainRegress[RainRegress$year == 1962,][,'interval'] <- 5
+RainRegress[RainRegress$year == 1967,][,'interval'] <- 5
+RainRegress[RainRegress$year == 1971,][,'interval'] <- 4
+RainRegress[RainRegress$year == 1977,][,'interval'] <- 6
+RainRegress[RainRegress$year == 1980,][,'interval'] <- 3
+RainRegress[RainRegress$year == 1984,][,'interval'] <- 4
+RainRegress[RainRegress$year == 1989,][,'interval'] <- 5
+RainRegress[RainRegress$year == 1991,][,'interval'] <- 2
+RainRegress[RainRegress$year == 1996,][,'interval'] <- 5
+RainRegress[RainRegress$year == 1998,][,'interval'] <- 2
+RainRegress[RainRegress$year == 1999,][,'interval'] <- 1
+
+#Data Preparation for regression is finally complete
+```
+
+```{r}
+#With all the data preparation complete, we can now finally perform regression
+
+#We first perform regression on total rain using the rain lag information and the rain lag of the neighbors. We will also be using the duration between election years as a factor variable for control
+RainRegression1 <- plm(TotalRain ~ RainLag + RainLagN + factor(interval), RainRegress, effect = "twoways", model = "within", index = "district")
+
+#We look at summary statistics
+summary(RainRegression1)
+```
+```{r}
+#Similarily, we perform regression on average SPI, also with its lag and neighbor lag as predictor variables. Again, we use interval as a factor variable for control.
+SPIRegression1 <- plm(AvgSPI ~ SPILag + SPILagN + factor(interval), RainRegress, effect = "twoways", model = "within", index = "district")
+
+#We look at summary statistics
+summary(SPIRegression1)
+```
+```{r}
+#For both Total Rain and Average SPI, we can see that the district's own lag is positively correlated with the dependent variable, where as the lag of the district's neighbors is negatively correlated with the dependent variable. This means that the amount of rain and SPI value for a region is positively correlated with the amount of rain and SPI value for the region for the previous period, while negatively correlated with the amound of rain and SPi value for the region's neighboring regions' previous periods.
+```
+
+(C) Meteorological scientists consider moderate droughts to occur if the Standardized Precipitation Index falls below -1, and moderate floods to occur if it rises above 1. 
+
+Create a measure that sums the number of years a district experiences either moderate droughts or floods during the interval starting from the year following the previous election up until the year of the current election. Perform the same test as in (B), using this new transformed measure. This measure will form the basis for the predictors used in the remainder of the regressions in Questions 2-5. 
+
+Since this is a count outcome that is reported as a discrete number of years, use a regression adopted for data of this form—this can be accomplished with the pglm package, using a model specified in the form of pglm(outcome variable ∼ predictor variables, data, effect = "twoways", model = "within", index = "district", family = "poisson"). What differences do you see between the estimates?
+
+```{r}
+#We basically repeat quesiton 1-a but for extreme weather calculation for each inter-election period
+#Let's create a revised version of the rain datatable
+ExRain <- data.frame()
+
+#The outer for loop isolates every district's entire historical data
+for (i in unique(RainRaw$district)) {
+  DistrictSubset <- RainRaw[RainRaw$district == i]
+  x <- 1
+  
+  #The inner for loop loops through every year of the district that's isolated
+  for (j in ElectionYear) {
+    #Creates a copy of rain data
+    ExRain2 <- ExRain
+    #We record the district, year, and sum up number of extreme weather years for that district for each election period
+    ExRain <- cbind.data.frame(district = i, year = j, DistrictSubset[x:(which(DistrictSubset$year == j)),] %>% summarise(ExWeather = sum(spi < -1 | spi > 1)))
+    
+    #We then bind the data together
+    ExRain <- rbind.data.frame(ExRain2, ExRain)
+   
+    #We then loop this for all districts 
+    x <- 1 + which(DistrictSubset$year == j)
+  }
+}
+
+#Let's create a copy of our cleaned rain data for regression purposes
+ExRainRegress <- ExRain
+
+#Let's calculate the lag for extreme weather and Rain then append it to our regression datatable
+ExRainRegress$ExLag <- append(0,ExRainRegress$ExWeather[-length(ExRainRegress$ExWeather)])
+#Again, we don't need 1951 if we are working with lag
+ExRainRegress <- ExRainRegress %>% filter(year != 1951)
+
+#Let's create a new dataframe for storing the lag of the neighbors
+ExNeighborLag <- data.frame()
+#We loop through every unique district
+for (i in unique(ExRainRegress$district)) {
+  # We find the list of neighbors for each district
+  NeighborList <- as.vector(BorderRaw[which(BorderRaw$focal_district == i),2])
+  
+  #We subset the rain data so that only neighbor data remains
+  #We then group by year, and calculate the average Extreme weather lag of neighbors
+  ExNeighborLagN <- ExRainRegress[ExRainRegress$district %in% NeighborList$district,] %>% group_by(year) %>% summarise(ExNeighborLag = mean(ExLag), district = i)
+  #Finally, we bind the data into the dataframe we created above
+  ExNeighborLag <- rbind.data.frame(ExNeighborLag,ExNeighborLagN)
+}
+
+#We can now combine the neighbor lag data into the extreme weather data for regression using inner join
+ExRainRegress <- inner_join(ExRainRegress,ExNeighborLag,by = c("district","year"))
+
+#Just like in 1-b, we need to hardcode the intervals between election years
+#We will again calculate the years between each election year, which we are forced to hardcode year by year. Luckly there isn't too many years. We first encode all intervals as 0 to cover 1951 (The first year), then individually encode each subsequent year
+ExRainRegress$interval <- 0
+ExRainRegress[ExRainRegress$year == 1957,][,'interval'] <- 6
+ExRainRegress[ExRainRegress$year == 1962,][,'interval'] <- 5
+ExRainRegress[ExRainRegress$year == 1967,][,'interval'] <- 5
+ExRainRegress[ExRainRegress$year == 1971,][,'interval'] <- 4
+ExRainRegress[ExRainRegress$year == 1977,][,'interval'] <- 6
+ExRainRegress[ExRainRegress$year == 1980,][,'interval'] <- 3
+ExRainRegress[ExRainRegress$year == 1984,][,'interval'] <- 4
+ExRainRegress[ExRainRegress$year == 1989,][,'interval'] <- 5
+ExRainRegress[ExRainRegress$year == 1991,][,'interval'] <- 2
+ExRainRegress[ExRainRegress$year == 1996,][,'interval'] <- 5
+ExRainRegress[ExRainRegress$year == 1998,][,'interval'] <- 2
+ExRainRegress[ExRainRegress$year == 1999,][,'interval'] <- 1
+
+#Data Preparation for regression is again complete for 1-c
+```
+
+
+```{r}
+#Last step for 1-c, just like in 1-b, is to perform regression on Extreme weather based on its lag and the lag of the districts' neighbors
+
+ExRegression1 <- pglm(ExWeather ~ ExLag + ExNeighborLag + interval, ExRainRegress, effect = "twoways", model = "within", index = "district", family = "poisson")
+summary(ExRegression1)
+```
+```{r}
+#Looking at the regression coefficients, we we can see that both lag and neighbor lag for extreme weather are extremely weakly correlated with extreme weather for each region. With correlations of below an absolutely value of 0.02, we can say that extreme weather appearing in a region is not associated with whether or not the region experienced extreme weather in the previous period, and/or whether its neighbors just experienced extreme weather. This is quite counterintuitive in a sense.
+
+#Comparing 1b and 1c, we can see that extreme weather is a lot more random than total rain and average SPI. Thus, we should proceed question 2-5 using extreme weather, as it in theory will be a better variable for modling the diffusion of political activity. Furthermore, we will also be using neighbor lag of extreme weather to diffusion effect.
+```
+
+2. Next, let’s analyze whether there are more new political parties when droughts or floods occur. 
+
+Run a regression predicting the number of new political parties that are formed as a function of the number of years a district experiences droughts or flooding in the interval starting from the year following the previous election up until the year of the current election. 
+
+The number of new political parties that enter a district is a discrete count outcome. However, it is likely that the rate of entry of political parties in any particular district in a particular period is also related, or “autocorrelated”, over time, to the rate of entry in the prior period’s of this district’s history. As a result, we will use a feasible generalized least squares estimator that can take into account district-specific autocorrelation. This can be accessed through the panelAR package using a model of the form panelAR(outcome variable ∼ predictor variables, data, panelVar, timeVar, autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE). 
+
+In this regression, we are specifying district fixed effects through “phet” and panel-specific autocorrelation through “psar1”. Also include a control in the regression for the number of years in the election period and a linear control for each election year. 
+
+```{r}
+#We innerjoin extreme weather and district data then select only the variables we need
+ExRainDistrict <- inner_join(ExRainRegress, DistrictRaw, by = c("district","year")) %>% select(district, year, new_parties, interval, ExWeather)
+
+#Making sure we don't include any NAs
+ExRainDistrict <- na.omit(ExRainDistrict)
+
+#We lastly regress total amount of new parties with extreme weather, with interval between elections as a control
+#Regress the number of new parties on the number of years with extreme weather:
+ExDistrictRegression1 <- panelAR(new_parties ~ ExWeather + interval, data=ExRainDistrict, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+summary(ExDistrictRegression1)
+```
+```{r}
+#While not super high, the correlation between extreme weather and new parties is significant at almost 0.1 (10%). We can say that more political parties are formed when a district experiences extreme weather. With extreme weather being a proxy for economic distruption, we can also say that more parties are formed when a district faces economic problems.
+```
+
+In addition to modeling the effect of extreme weather on the overall entry of new parties, do certain kinds of political parties seem to be more likely than other kinds to be formed when a district experiences extreme weather?
+
+```{r}
+#We inner join the district data with extreme weather again
+ExRainDistrict2<- inner_join(ExRainRegress, DistrictRaw, by = c("district","year"))
+
+#We only need the data on new parties, year, district, interval and extreme weather
+Sub = c(1:3,6,9:24)
+ExRainDistrict2 <- ExRainDistrict2[,Sub]
+
+#Making sure we don't include any NAs
+ExRainDistrict2 <- na.omit(ExRainDistrict2)
+
+#Let's create an empty dataframe to store the coefficients of the regressions
+PartyCoef <- data.frame()
+#We then extract all the types of parties
+PTypeNames <- as.character(names(ExRainDistrict2)[-c(1:4)])
+
+#We Run Regression on each type of party. this is highly repetitive but unfortunately panelAR doesn't work nicely with for loops or lapply. 
+PartyCoefRegression1 <- panelAR(new_parties_caste ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_socialist ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_communist ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_secular ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_nationalist ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#There are no new_parties_economic within our dataset so we can go ahead and skip it
+#Let's remove new_parties_economic from our list of types as well
+PTypeNames <- PTypeNames[-6]
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_liberal ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_religious ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_ethnic ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_farleft ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_national_scope ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_state_scope ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_regional_scope ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_subnational_scope ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_farright ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+#################
+#This is repeated until we go through all the parties
+PartyCoefRegression1 <- panelAR(new_parties_farming ~ ExWeather + interval, data=ExRainDistrict2, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+#We extract the intercept and coefficients data
+PartyCoefN <- summary(PartyCoefRegression1)$coefficients[,1]
+#Finally, we bind the data into the dataframe we created above
+PartyCoef <- rbind.data.frame(PartyCoef,PartyCoefN)
+
+#Let's set the row and column names so we don't get confused
+row.names(PartyCoef) <- PTypeNames
+colnames(PartyCoef) <- c("(Intercept)","ExWeather","interval")
+
+#Let's order the extreme weather coefficients decreasing
+PartyCoef <- PartyCoef[order(PartyCoef$ExWeather, decreasing=TRUE),]
+
+#Let's take a look
+PartyCoef
+```
+```{r}
+#Looking at the correlation values, it seems like new national-level and sub-national-level parties are the most common type when a region faces extreme weather/economic disruption. When it comes to political spectrum, it seems like socialist, far left, secular and religious parties are the highest correlated. All other parties types have correlations of under 1% after rounding. This intuitively makes sense, as these socialist and far-left voters are typically the ones who who want immediate change and are the revolutionary type. On the other hand, secular and religious parties also make sense as these voters typically attribute extreme weather/economic disruption as acts of god and out of their control. In both cases, new parties pop up to specifically target these voters. Thus, it would make sense that the creation of these types parties are positively correlated with extreme weather.
+
+#On the negative correlated side, only far right, ethnic, communist and liberal parties are very weakly negatively correlated with extreme weather. These types of party typically like to blame problems on specific groups of people / demographic / ethnicity / social class / people from specific parts of the world, so when something as uncontrollable like extreme weather happens it may weaken their political platforms.
+```
+
+3. Now that we have established the baseline effect, we can look at how political activity stimulated by droughts or floods in one district might affect political activity in another district. 
+
+Use a similar regression to Question 2 to show that, even when taking into account a district’s own droughts and floods, the level of entry of new political parties in a district will also depend on the number of years its neighboring districts experience years of droughts or flooding in the interval starting from the year following two elections ago, up until the year of the previous election—the election lead-up interval before the current one. 
+
+Similar to Question 2, include a control in the regression for the number of years in the current election period, a control for the time-invariant features of a district as fixed effects, and a linear control for each election year.
+
+Combine 2 tables and select the columns we want:
+```{r}
+#We basically repeat question 2 with innerjoin and selecting the columns we need
+ExRainDistrict3 <- inner_join(ExRainRegress, DistrictRaw, by = c("district","year")) %>% select(district, year, new_parties, interval, ExWeather, ExNeighborLag)
+#Making sure we don't include any NAs
+ExRainDistrict3 <- na.omit(ExRainDistrict3)
+
+#We lastly regress total amount of new parties with extreme weather, and neighbor's extreme weather lag, with interval between elections as a control
+ExDistrictRegression2 <- panelAR(new_parties ~ ExWeather + ExNeighborLag + interval, data=ExRainDistrict3, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+summary(ExDistrictRegression2)
+```
+
+```{r}
+#Looking at the results, we can clearly see that there is a strong positive correlation between the number of new parties and the number of extreme weather events and the extreme weather lag of the neighbors. From this, we can say that more parties are formed when either the region is experiencing extreme weather/ economic disruption in the current cycle, and more parties are formed when neighboring regions faced extreme weather/economic disruption in the past. This is intuitive as voters want immediate change if they are facing problems and/or to avoid whatever bad happened in other regions after they went through extreme weathers and/or economic disruption. New parties will be created to target this population. Likewise, a state experiencing weather/economic problems will also affect its neighbors in the next election cycle, propagating the effect.
+```
+
+4. Extreme weather events like droughts or floods can erode the stability of political systems and wear away at the entrenched power bases of large, national-scale parties that have difficulty responding to the needs of affected regions. 
+
+(A) Does experiencing droughts or floods relate differently to the entry and diffusion of political parties depending on their scope? 
+
+Perform regressions, similar to Question 3, one each predicting the entry of new national, state, and regional scope parties as the outcome based on extreme weather in a district in the period leading up to the current election and based on extreme weather in neighboring districts in the period leading up to the prior election. 
+
+Include a control in the regression for the number of years in the election period, a control for the time-invariant features of a district, and a linear control for each election year.
+
+```{r}
+#We again repeat question 2 and 3 with innerjoin and selecting the columns we need
+ExRainDistrict4 <- inner_join(ExRainRegress, DistrictRaw, by = c("district","year")) %>% select(district, year, new_parties_national_scope, new_parties_state_scope, new_parties_regional_scope, interval, ExWeather, ExNeighborLag)
+#Making sure we don't include any NAs
+ExRainDistrict4 <- na.omit(ExRainDistrict4)
+
+#We regress total number of national parties with extreme weather, extreme weather lag, and neighbor's extreme weather lag, with interval between elections as a control
+ExDistrictRegression3 <- panelAR(new_parties_national_scope ~ ExWeather + ExNeighborLag + interval, data=ExRainDistrict4, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+summary(ExDistrictRegression3)
+```
+
+```{r}
+#Looking at the results, we can see a strong correlation between number of new national scope parties and whether or not a region is experiencing extreme weather (0.05) and whether the regions neighbors have experienced extreme weather in the past (0.21). This intuitively makes sense and is in-line with my explaination for 3. New national parties are created to target current weather/economic problems in the region and/or avoid past weather/economic problems that have occured in neighboring regions.
+
+#We repeat the process for state-level parties
+#We regress total number of state parties with extreme weather, extreme weather lag, and neighbor's extreme weather lag, with interval between elections as a control
+ExDistrictRegression4 <- panelAR(new_parties_state_scope ~ ExWeather + ExNeighborLag + interval, data=ExRainDistrict4, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+summary(ExDistrictRegression4)
+```
+
+```{r}
+#This time, we see that none of the extreme weather factors have much correlation with the formation of new state-scope parties. With the highest correlation at -2% between whether a region's neighbors experienced extreme weather in the past and the formation of new state-scope parties, not much can be said. We can maybe make the assumption that state-level politians are not interested in whether or not a region experienced bad weather in the past cycle. Indeed, since extreme weather and/or economic problems are mostly regional and/or widespread/national, with bad events catching national attention, it doesn't make a lot of sense for state-level parties to be correlated with weather and/or economic problems, especially since weather does not follow state borders.
+
+#We lastly regress total number of regional parties with extreme weather, extreme weather lag, and neighbor's extreme weather lag, with interval between elections as a control
+ExDistrictRegression5 <- panelAR(new_parties_regional_scope ~ ExWeather + ExNeighborLag + interval, data=ExRainDistrict4, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+summary(ExDistrictRegression5)
+```
+```{r}
+#Interestingly, regional-level parties also have weak correlations with whether the region is experiencing extreme weather/economic problems (0.001) and or whether the region's neighbors experienced weather problems in the past (-0.02). With the highest correlation at -2% between whether a region's neighbors experienced extreme weather in the past and the formation of new state-scope parties, not much can be said. If anything, we can guess that politicans who want to start a new party will rush to the neighboring regions that have just experienced extreme weather/economic disruption to form new parties, leaving the current region and causing number of new parties to drop.
+```
+
+(B) Does experiencing droughts or floods relate to political concentration? 
+
+Perform a regression, similar to Question 3, predicting the Herfindahl Index of a region as a function of the number of years of droughts or flooding that occur in a district in the interval leading up to the current election, and the number of years of droughts or flooding that occur in its neighboring districts in the interval leading up to the previous election.
+
+Include a control in the regression for the number of years in the election period, a control for the time-invariant features of a district, and a linear control for each election year.
+
+What does this result illustrate in terms of the concentration or fragmentation of political power in districts affected by extreme weather?
+
+```{r}
+#Similar to all the problems above, we start by combining the two tables that we need and selecting the columns that we need
+ExRainDistrict5 <- inner_join(ExRainRegress, DistrictRaw, by = c("district", "year")) %>% select(district, year, political_concentration, interval, ExWeather, ExNeighborLag)
+
+#Making sure we don't include any NAs
+ExRainDistrict5 <- na.omit(ExRainDistrict5)
+
+#Regress the Herfindahl Index on the number of years with extreme weather and neighbors' previous measure:
+ExDistrictRegression6 <- panelAR(political_concentration ~ ExNeighborLag + ExWeather + interval, data=ExRainDistrict5, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+summary(ExDistrictRegression6)
+```
+```{r}
+#We can see that the Herfindal Index is strongly negatively correlated with both number of years of extreme weather in a region (-38.3) and the number of years of extreme weather in the region's neighbor leading up to the pervious period(-15.0). Intuitively, this makes sense, as strong weather/economic disruption will lead to less political power, and strong weather/economic disruption in the previous period in neighboring regions could indicate that trouble is leading this way (towards the region in question), which is a perfect example of the diffusion effect. All in all, we can say that extreme weather events and economic volatility directly reduces political stability. Extreme weather directly leads to political fragmentation. 
+```
+
+5. Political parties are formed to accomplish a variety of goals. Individual parties can also exist in the context of larger social and cultural trends, especially when regions influence each other as political organizing activity diffuses across regions over time. 
+
+To understand the diffusion process more, we want to analyze whether the new parties that appear in a district are the same parties that have appeared in neighboring districts in the past, or if it the process of political organization, rather than the content of a specific political party, that is diffusing. 
+
+To analyze this, run two separate regressions predicting the likelihood of (1) new political parties being founded in a district, that have contested an election in a neighboring district in any previous election period, and (2) new political parties being founded in a district that have not contested an election in a neighboring district in any previous election period.
+
+As in Questions 3 and 4, estimate these as a function of the number of years of droughts or flooding that occur in a district in the interval leading up to the current election and the years of droughts or flooding that occur that occur in its neighboring districts in the period leading up to the prior election. 
+
+Include as controls in the regression the number of years in the election period, the timeinvariant features of a district, and a linear control for the election year. What does the results illustrate about the level and process diffusion of political organizing?
+
+```{r}
+#We first need to calculate whether a party contested in an election in a neighboring district in any previous elections
+
+#We create an empty data frame to store the results
+ContestChance <- data.frame()
+
+#We can reuse the rain district data from question 3, and loop through every unique district
+for (i in unique(ExRainDistrict3$district)) {
+  NeighborList <- as.vector(BorderRaw[which(BorderRaw$focal_district == i),2])
+  
+  #We used [-1] because we don't want to use 1951
+  for (j in ElectionYear[-1]) {
+    
+    #We get a list of the names of the parties in a district in a year
+    DistrictParty <- as.vector(NewPartyRaw[NewPartyRaw$district == i & NewPartyRaw$year == j,]$party_name)
+    
+    #We create a list of the names the parties in the neighboring districts 
+    NeighborPartyList <- as.vector(unique(NewPartyRaw[NewPartyRaw$district %in% NeighborList$district & NewPartyRaw$year < j ,] %>% select(party_name))$party_name)
+    
+    #Since two different parties can both be called independent we don't want this in our data
+    NeighborPartyList <- NeighborPartyList[NeighborPartyList != "Independent"]
+    
+    #We then take the total number of party names that appear in neighboring regions, divided by the length of the list of party names that appear in neighboring regions, as it may appear in multiple regions
+    Contest <- sum(DistrictParty %in% NeighborPartyList) / length(DistrictParty %in% NeighborPartyList)
+    
+    #We know contest and no contest has to add up to 1, but just in case we repeat the calculation for contest again, and take it from the total length of the number of parties that also have appeared in neighboring regions
+    ContestN <- (length(DistrictParty %in% NeighborPartyList) - sum(DistrictParty %in% NeighborPartyList)) / length(DistrictParty %in% NeighborPartyList)
+    
+    #We build a temporary dataframe to record the district, year, and contest/no contest values
+    ContestChance2 <- cbind.data.frame(district = i,year = j,Contest,ContestN)
+    
+    #We bind the data into our final dataframe, and loop again
+    ContestChance <- rbind(ContestChance, ContestChance2)
+  }
+}
+
+#Combine our calculated contest/nocontest table with our Extreme Weather Regression Table
+LikelyRegression <- inner_join(ContestChance,ExRainRegress, by = c("district", "year"))
+#Let's remove all NAs since the there might be NaNs from the contest calculations above
+LikelyRegression <- na.omit(LikelyRegression)
+
+
+#The last step is to conduct regression on Contest using Extreme weather in neighboring regions in previous periods, extreme weather in this region in this period and interval as variables. 
+ContestLikelyRegression <- panelAR(Contest ~ ExNeighborLag + ExWeather + interval, data=LikelyRegression, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+summary(ContestLikelyRegression)
+```
+
+```{r}
+#Looking at the results of the previous regression, we see that both extreme weather in this region in this period and extreme weather in neighboring regions in previous period are negatively correlated with the likelihood that a new party in a region is one that have previously contested in an election in a neighboring district. We will discuss the implications of this after we run our second regression with no-contest data.
+
+
+#We run regression again, but this time with noncontested parties against extreme weather and extreme weather in neighboring regions in previous period
+ContestLikelyRegression2 <- panelAR(ContestN ~ ExNeighborLag + ExWeather + interval, data=LikelyRegression, panelVar = "district", timeVar= "year", autoCorr = "psar1", panelCorrMethod = "phet", rho.na.rm = TRUE)
+summary(ContestLikelyRegression2)
+```
+
+
+```{r}
+#On the other hand, the results of this regression shows us that both extreme weather in this region in this period and extreme weather in neighboring regions in previous period are positively correlated with the likelihood that a new party in a region is one that have NOT previously contested in an election in a neighboring district.
+
+#While the correlations from both regression are not super strong, they do show us a general direction for correlation. We can therefore make the statement that extreme weather/economic disruption tend to dissuade existing parties in neighboring districts from running. At the same time, extreme weather/economic disruption tend to bring with them new/fresh parties that previously were not seen in neighboring regions.
+
+#All in all, we can say that extreme weather events and/or economic disruptions drive diffusion based on entire political organizations as opposed than a specific party.
