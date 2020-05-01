@@ -1,0 +1,465 @@
+---
+title: "SN Assignment 4"
+author: "Carl Xi"
+date: "11/20/2019"
+output: 
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+#Setup
+rm(list = ls(all = TRUE))
+library(data.table)
+library(sqldf)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(proxy)
+library(igraph)
+library(plm)
+library(pglm)
+library(panelAR)
+library(qdapTools)
+
+setwd("C:/Users/carlj/OneDrive/Documents/School-MSBA/Classes/Fall/Social Network Analytics/Assignment 4")
+Box <- read.csv(file = 'box_office_revenues.csv', header = TRUE, sep = ',')
+Cast <- read.csv(file = 'film_cast_members.csv', header = TRUE, sep = ',')
+Keywords <- read.csv(file = 'film_keywords.csv', header=TRUE, sep = ',')
+Subsid <- read.csv( file = 'production_subsidiaries.csv', header = TRUE, sep = ',')
+Producers <- read.csv( file = 'producers_and_films.csv', header = TRUE, sep = ',')
+
+options(warn = -1)
+
+#Data Cleaning
+#We only need US producers, find the unique producers and remove any NAs
+Producers <- Producers[Producers$country=='us',]
+Producers <- unique(Producers)
+Producers<-na.omit(Producers)
+```
+1. First, we want to know if filmmakers that engage in collaborations with one another are more innovative or not. We can measure innovation through the number of new, never-before-seen keywords that are used in a film. We can also measure innovation through the number of new combinations of existing keywords that are used in a film. To account for the natural time cycle of the production process, consider a keyword or combination to be “new” if it has been introduced within the last three years.
+
+We also want to know what kinds of collaborations contribute to innovation: are collaborations between large, “generalist” production companies more innovative? Or, are collaborations between large producers and more specialized, smaller producers more innovative?
+
+For this first question, consider two different measures of identifying whether a firm is a generalist or not. Base one measure on the scale of a company’s productions: consider a production company to be a generalist if it is in the top quartile of the number of films released by producers that year. In general, a producer will be classified as a generalist if it makes more than one film in a year. 
+
+Base the second measure on a company’s global coreness in the collaboration network: consider a production company to be a generalist if it is in the top quartile of coreness (eigenvector centrality) over its last ten observations. If a company has fewer than ten observations, treat the non-existent observations as zeros. 
+```{r}
+#We start by joining the Producers table into the Keywords table in order to figure out the unique keywords
+KeywordsFilms <- left_join(Keywords, Producers)
+
+#We then filter out all NAs from our joined table, select only what we need (the first 3 columns)
+KeywordsFilms <- KeywordsFilms[!is.na(KeywordsFilms$year),]
+KeywordsFilms <- KeywordsFilms[!is.na(KeywordsFilms$keyword),]
+KeywordsFilms <- KeywordsFilms[,1:3]
+KeywordsFilms <- unique(KeywordsFilms)
+
+# With all duplicates removed, we can now group our dataset by keyword then find a full list of unique keywords. we will create a new column called NewWord
+KeywordsFilms <- KeywordsFilms %>% group_by(keyword) %>% arrange(keyword, year) %>% mutate(NewWord = ifelse(year %in% c(min(year), min(year)+1, min(year)+2, min(year)+3),1,0))
+
+#With all the unique keywords found, we can now count the number of unique keywords that appear in each film. We will combine all keywords of each film into a single string and compare them across films, and marking all duplicate lists as not-new.
+
+#We need to calculate the total number of new words in each movie
+KeywordsFilms <- KeywordsFilms %>% group_by(pindex) %>% mutate(SumNew = sum(NewWord)) %>% arrange(pindex)
+
+#We will only extract the each movie's pindex and the total number of new words
+Subset <- KeywordsFilms[,c(1,5)]
+Producers <- left_join(Producers, Subset)
+Producers <- unique(Producers)
+PrducrKywdFlmC <- Producers[!is.na(Producers$SumNew),]
+
+
+
+# Let make a copy of our KeywordsFilms that is specifically used to find combinations
+KeywordsFilmsC <- KeywordsFilms %>% group_by(pindex) %>% mutate(combo = paste(list(keyword), sep=","))
+
+#We then group by the unique keywords string column that we made above
+KeywordsFilmsC <- KeywordsFilmsC %>% group_by(combo) %>% # group by the new words column
+  mutate(NewWordC = ifelse(year %in% c(min(year), min(year)+1, min(year)+2, min(year)+3),1,0))
+
+KeywordsFilmsC <- KeywordsFilmsC %>% group_by(pindex) %>% summarise(NewC=mean(NewWordC))
+
+
+#We now need to classify the films as generalists vs specialists through two methods/definitions. The first by number of films made per year and the second by eigen centralities.
+
+#We join our combied keywords set into producers data
+PrducrKywdFlmC <- left_join(Producers,KeywordsFilmsC)
+
+#We create a subset of our producer data to calculate number of films each producer made per year. 
+ProducerSubset <- Producers[, c(1,2,4)]
+
+#Make sure we remove repeats
+ProducerSubset <- unique(ProducerSubset)
+
+#For our first definition, generalists are the top 25% of producers by number of films made, with specialists being the rest
+ProducerSubset <- ProducerSubset %>% group_by(year, pcindex) %>% mutate(NumFilms = n())
+
+ProducerSubset <- ProducerSubset[,2:4]
+ProducerSubset <- unique(ProducerSubset)
+
+#calculating the first quartile and remainders
+ProducerSubset <- ProducerSubset %>% group_by(year) %>% mutate(quartile = quantile(NumFilms, prob=0.75)) 
+
+ProducerSubset$GenDef1 <- ifelse(ProducerSubset$NumFilms > ProducerSubset$quartile,1,0)
+
+
+#For our second definition, we calculate the eigen centrality of each producer. Again, we will take the top 25% of producers, but this time by eigen centrality. The definitions stay the same (top 25% are generalists while the remaining people are specialists.)
+
+#We only need to look at films with more than one producer
+PrducrFlmE <- PrducrKywdFlmC %>% group_by(pindex) %>% filter(n() >1)
+
+PrducrFlmE <- left_join(PrducrFlmE, ProducerSubset)
+
+#We can now get the edge list
+PrducrFlmE <- as.data.table(PrducrFlmE)
+PrducrFlmESubset <- PrducrFlmE[,as.data.table(t(combn(pcindex,2))), .(pindex,year)]
+PrducrFlmESubset <- PrducrFlmESubset[,c("V1","V2")]
+PrducrFlmESubset <- unique(PrducrFlmESubset)
+
+#With the edgelist we can now create a graph and derive the eigen centrality
+Graph1 <- graph.edgelist(as.matrix(PrducrFlmESubset), directed = FALSE)
+Centrality1 <- eigen_centrality(Graph1)$vector
+
+
+Centrality1 <- cbind(names(Centrality1), Centrality1)
+colnames(Centrality1)[1] <- "pcindex"
+PrducrKywdFlmCCent <- left_join(PrducrKywdFlmC, as.data.frame(Centrality1))
+
+PrducrKywdFlmCCent$centralities <- unname(PrducrKywdFlmCCent$Centrality1)
+PrducrKywdFlmCCent$centralities <- as.numeric(as.character(PrducrKywdFlmCCent$centralities))
+
+# Unconnected firms are 0 not NA
+PrducrKywdFlmCCent$centralities <- sapply(1:nrow(PrducrKywdFlmCCent), function(x) {
+  if (is.na(PrducrKywdFlmCCent$centralities[x])) {
+    PrducrKywdFlmCCent$centralities[x] <- 0
+  }
+  else
+    PrducrKywdFlmCCent$centralities[x] <- PrducrKywdFlmCCent$centralities[x]
+})
+
+#eigen centrality level
+#this chunk assigns generalist or specialist
+PrducrKywdFlmCCentUniq <- distinct(PrducrKywdFlmCCent[,c(2,4,10)])
+PrducrKywdFlmCCentUniq <- PrducrKywdFlmCCentUniq %>%
+  group_by(year) %>%
+  mutate(eigen_quartile = quantile(centralities, prob=0.75, na.rm=TRUE)) 
+
+PrducrKywdFlmCCentUniq$GenDef2 <- ifelse(PrducrKywdFlmCCentUniq$centralities > PrducrKywdFlmCCentUniq$eigen_quartile,1,0)
+#------------------------------------
+
+```
+(A) Classify each film by the type of collaboration that it represents. There should be five types for each measure of generalism: 
+
+i. Peripheral solo productions: films made by a single specialist
+ii. Central solo productions: films made by a single generalist
+iii. Central co-productions: films made by a group of multiple generalists
+iv. Peripheral co-productions: films made by a group of multiple specialists
+v. Hybrid co-productions: films made by a group of generalists and specialists
+
+For each measure of generalism, a figure that illustrates the number of new keywords and new combinations of existing keywords that are introduced per type of film over the course of the data. On the x-axis should be years, and on the y-axis should be the count of new keywords or new combinations.
+
+```{r}
+#With the two versions of generalist/specialists defined, we can now move onto categorizing the films into the 5 categories of 1a)
+
+
+#We can simplify this problem by first defining the films as solo or co-productions, then sub-setting them further from there
+
+#We first join the dataframe we have been building up with our producer subset from above, then again join our second definition into this monster of a dataset
+PrducrKywdFlmC <- left_join(PrducrKywdFlmC, ProducerSubset, by=c("year","pcindex"))
+PrducrKywdFlmC <- left_join(PrducrKywdFlmC, PrducrKywdFlmCCentUniq, by=c("year","pcindex"))
+
+#We then group the dataset by the films
+PrducrKywdFlmC <- PrducrKywdFlmC %>% group_by(pindex) %>% mutate(co_or_solo = ifelse(n()>1,"Co","Solo"))
+
+#We first classify the 5 categories using the first definition
+PrducrKywdFlmC <- PrducrKywdFlmC %>% group_by(pindex) %>% mutate(TypeDef1 = ifelse(co_or_solo=="Solo", ifelse(GenDef1==1,"Central Solo","Peripheral Solo"), ifelse(length(unique(GenDef1))>1,"Hybrid Co-prod", ifelse(unique(GenDef1)==1,"Central Co-prod","Peripheral Co-prod"))))
+
+#We now classify the 5 categories using our second definition
+PrducrKywdFlmC <- PrducrKywdFlmC %>% group_by(pindex) %>% mutate(TypeDef2 = ifelse(co_or_solo=="Solo", ifelse(GenDef2==1,"Central Solo","Peripheral Solo"), ifelse(length(unique(GenDef2))>1,"Hybrid Co-prod", ifelse(unique(GenDef2)==1,"Central Co-prod","Peripheral Co-prod"))))
+```
+
+```{r}
+#We can finally move onto the graphs. The first graph is new words for each film type over time, with generalist defined by top 25% of all Producers by number of new films made per year. 
+
+#We encode the necessary graph data
+Plot1 <- PrducrKywdFlmC %>% group_by(year, TypeDef1) %>%  filter(!is.na(SumNew)) %>% mutate(unq1 = sum(SumNew)) 
+Plot1 <- Plot1[,c('year', 'unq1', 'TypeDef1')]
+Plot1 <- Plot1[!duplicated(Plot1),]
+
+#This creates the plot
+ggplot(Plot1, aes(x=year, y=unq1, color=TypeDef1)) + geom_line() + ggtitle('Generalist Definition 1 (New Words)') + ylab("Unique Words") + xlab("Year") + labs(subtitle = "Generalist is defined by top 25% of all Producers by number of films made per year.")
+```
+
+```{r}
+#The second graph is new words for each film type over time, with generalist defined by top 25% of all Producers by eigen centrality.
+
+#We encode the necessary graph data
+Plot2 <- PrducrKywdFlmC %>% group_by(year, TypeDef2) %>% filter(!is.na(SumNew)) %>% mutate(unq2 = sum(SumNew)) 
+Plot2 <- Plot2[,c('year', 'unq2', 'TypeDef2')]
+Plot2 <- Plot2[!duplicated(Plot2),]
+
+#This creates the plot
+ggplot(Plot2, aes(x=year, y=unq2, color=TypeDef2)) + geom_line() + ggtitle('Generalist Definiton 2 (New Words)') + ylab("Unique Words") + xlab("Year") + labs(subtitle = "Generalist is defined by top 25% of all Producers by eigen centrality.")
+```
+```{r}
+#The third graph is sum of new word combinations for each film type over time, with generalist defined by top 25% of all Producers by number of new films made per year.
+
+#We encode the necessary graph data
+Plot3 <- PrducrKywdFlmC %>% group_by(year, TypeDef1) %>% filter(!is.na(NewC)) %>% mutate(unq_combo1 = sum(NewC)) 
+Plot3 <- Plot3[,c('year', 'unq_combo1', 'TypeDef1')]
+Plot3 <- Plot3[!duplicated(Plot3),]
+
+#This creates the plot
+ggplot(Plot3, aes(x=year, y=unq_combo1, color=TypeDef1)) + geom_line() + ggtitle('Generalist Definition 1 (New Combinations)') + ylab("Unique Words") + xlab("Year") + labs(subtitle = "Generalist is defined by top 25% of all Producers by number of films made per year.")
+```
+
+```{r}
+#The fourth graph is sum of new word combinations for each film type over time, with generalist defined by top 25% of all Producers by eigen centrality.
+
+#We encode the necessary graph data
+Plot4 <- PrducrKywdFlmC %>% group_by(year, TypeDef2) %>% filter(!is.na(NewC)) %>% mutate(unq_combo2 = sum(NewC)) 
+Plot4 <- Plot4[,c('year', 'unq_combo2', 'TypeDef2')]
+Plot4 <- Plot4[!duplicated(Plot4),]
+
+#This creates the plot
+ggplot(Plot4, aes(x=year, y=unq_combo2, color=TypeDef2)) + geom_line() + ggtitle('Generalist Definition 2 (New Combinations)') + ylab("Unique Words") + xlab("Year") + labs(subtitle = "Generalist is defined by top 25% of all Producers by eigen centrality.")
+```
+(B) For each measure of generalism, estimate one regression predicting the number of new keywords and another regression predicting the number of new combinations of existing keywords producers introduce in a year. Use as predictors the number of films a producer makes that year that year that fall into each of the three co-production types. So, there will be three collaboration predictors:
+
+i. Central co-productions: number of Central co-productions a producer made that year
+ii. Peripheral co-productions: number of Peripheral co-productions a producer made that year
+iii. Hybrid co-productions: number of Hybrid co-productions a producer made that year
+
+Also include control variables for a producer’s box office revenue that year, how many years the producer has been in operation, whether or not the producer is a subsidiary, and a time trend for each year.
+
+Since it is possible for some genres of films to be more innovative than others, also control for the content of producers’ films. To do this, perform a multidimensional scaling using two dimensions that uses as the input the Jaccard distance between each producer based on the co-occurrence—the overlap—of keywords that they use in their films. To account for the natural time cycle of the production process, use as the comparison set for similarity the current year as well as the two years before the current year. You can calculate Jaccard distance using the dist() command from the proxy package, and you can perform the multidimensional scaling using the cmdscale() command from the stats package, which is automatically loaded when R starts. Use the two coordinates produced by the multidimensional scaling as controls in the regression. Similar to the political parties on the previous exercise, the outcome variable is a count, so we can use a regression adopted for data of this form using the MASS package, using a model specified in the form of 
+
+glm.nb(new keywords variable ∼ Central co-productions + Peripheral co-productions + Hybrid co-productions + Coordinate 1 + Coordinate 2 + Total box office + Number of years in operation + Is subsidiary + factor(year), data, offset(total films made that year, for which there is keyword information)) 
+
+The offset accounts for the fact that making more films provides more opportunities to produce new keywords—it allows us to estimate the outcome as a per-film rate. What kinds of collaborations seem to result in the most new keywords and new combinations of existing keywords? Comparing the two measures of generalism, are collaborations between large or small companies or core and peripheral companies more effective for creative innovation?
+
+```{r}
+#We will first create three new variables. The first shows the number of each type of film that a Producer makes. The second variable is whether a producer is a subsidiary, and the third variable is the age of the producer. We will do this process first for our first definition of generalist, and repeat it for our second definition.
+
+#We create a copy of our absurdly named dataframe that is arranged by the film index number
+Combined <- PrducrKywdFlmC %>% arrange(pcindex)
+
+#For our first variable, we basically pivot the columns of the five types of films. Luckily, We will only have to do this for co-productions. We then take the sum over the types for each producer.
+Combined <- Combined %>% mutate(CentralCoDef1 = ifelse(TypeDef1 == "Central Co-prod", 1, 0))
+Combined <- Combined %>% mutate(PeripheralCoDef1 = ifelse(TypeDef1 == "Peripheral Co-prod", 1, 0))
+Combined <- Combined %>% mutate(HybridCoDef1 = ifelse(TypeDef1 == "Hybrid Co-prod", 1, 0))
+Combined <- Combined %>% group_by(pcindex, year) %>% mutate(CentralCoDef1Sum = sum(CentralCoDef1)) %>% arrange(pcindex)
+Combined <- Combined %>% group_by(pcindex, year) %>% mutate(PeripheralCoDef1Sum = sum(PeripheralCoDef1)) %>% arrange(pcindex)
+
+Combined <- Combined %>% group_by(pcindex, year) %>% mutate(HybridCoDef1Sum = sum(HybridCoDef1)) %>% arrange(pcindex, year)
+
+#With the first variable calculated, we can now add in the other two variables and put everything together
+Combined2 <- left_join(Combined, Box[,c(1,4)])
+Combined2 <- Combined2[!is.na(Combined2$total_box),]
+Combined2 <- left_join(Combined2, Subsid)
+Combined2 <- Combined2 %>% mutate(IsSubsid = ifelse(year %in% range(first_year, last_year), 1, 0))
+Combined2 <- Combined2 %>% group_by(pcindex) %>% mutate(years_old = year - min(year)) %>% arrange(year, pcindex)
+```
+```{r}
+#With everything ready, we can now run a regression for generalist defined by top 25% of all Producers by number of new films made per year.
+Model1 <- glm.nb(SumNew ~ CentralCoDef1Sum + PeripheralCoDef1Sum + HybridCoDef1Sum + total_box + years_old + IsSubsid, Combined2, offset(NumFilms))
+summary(Model1)
+```
+
+```{r}
+#Looking at the results, we can see that the coefficient for sum of central co-production is positive while the coefficient for peripheral and hybrid co-productions are negative. This tells us that central co-productions are positively correlated with new keywords, and that more central co-productions will results in more new keywords. On the other hand, peripheral and hybrid co-productions are negatively correlated with new keywords, and that more of these types of productions will result in less new keywords. 
+```
+
+```{r}
+#We now repeat the above process for our second definition. We will once again create three new variables. The first shows the number of each type of film that a Producer makes. The second variable is whether a producer is a subsidiary, and the third variable is the age of the producer. 
+
+#We once again create a copy of our absurdly named dataframe that is arranged by the film index number
+Combined <- PrducrKywdFlmC %>% arrange(pcindex)
+
+#For our first variable, we basically pivot the columns of the five types of films. Luckily, We will only have to do this for co-productions. We then take the sum over the types for each producer.
+Combined <- Combined %>% mutate(CentralCoDef2 = ifelse(TypeDef2 == "Central Co-prod", 1, 0))
+Combined <- Combined %>% mutate(PeripheralCoDef2 = ifelse(TypeDef2 == "Peripheral Co-prod", 1, 0))
+Combined <- Combined %>% mutate(HybridCoDef2 = ifelse(TypeDef2 == "Hybrid Co-prod", 1, 0))
+Combined <- Combined %>% group_by(pcindex, year) %>% mutate(CentralCoDef2Sum = sum(CentralCoDef2)) %>% arrange(pcindex)
+Combined <- Combined %>% group_by(pcindex, year) %>% mutate(PeripheralCoDef2Sum = sum(PeripheralCoDef2)) %>% arrange(pcindex)
+
+Combined <- Combined %>% group_by(pcindex, year) %>% mutate(HybridCoDef2Sum = sum(HybridCoDef2)) %>% arrange(pcindex, year)
+
+#With the first variable calculated, we can now add in the other two variables and put everything together
+Combined2 <- left_join(Combined2, Combined)
+Combined2 <- left_join(Combined2, Box[,c(1,4)])
+Combined2 <- Combined2[!is.na(Combined2$total_box),]
+```
+```{r}
+#With everything ready, we can now run a regression for generalist defined by top 25% of all Producers by eigen centrality.
+Model2 <- glm.nb(SumNew ~ CentralCoDef2Sum + PeripheralCoDef2Sum + HybridCoDef2Sum + total_box + years_old + IsSubsid, Combined2, offset(NumFilms))
+summary(Model2)
+```
+```{r}
+#Looking at the second set of results, we can see that the coefficient for sum of central and peripheral co-productions are positive while the coefficient hybrid co-production is negative. This tells us that central and peripheral co-productions are positively correlated with new keywords, and that more of these types of co-productions will results in more new keywords. On the other hand, hybrid co-productions are negatively correlated with new keywords, and that more hybrid productions will result in less new keywords. 
+
+#Comparing the results across both definitions, we can see that  the first definitions describes a positive relationships between the size or producers and number of key words. This intuitively makes sense as larger firms naturally means more information flow. The second definition tells us that collaboration between peripheral producers lead to the biggest increase in number of new key words. This could be due to the fact that while peripheral producers may not have as much information flow, their information is a lot more unique, which leads to more innovative and never-seen-before keywords. 
+
+#Unfortunately, the Jaccard distance portion was not completed as it was simply taking way too long to complete. Instead, I have decided to try to tackle the other questions. This naturally has an implication on question 2, but I will describe how I WOULD go abouts answering the question had I calculated the distance.
+```
+2. What might explain why some collaborations result in more innovative films than others? It could be that when producers collaborate with other producers that are too similar to themselves, their experience is less diverse and it is more difficult to come up with new innovations. On the other hand, when producers are too dissimilar, it can be hard to coordinate and combine very different creative ideas.
+
+We can measure the extent to which a producer collaborates with similar producers as the average Jaccard distance between a producer and the other producers it works with based on the co-occurrence of keywords the producers use. 
+
+Generate this measure yearly for each producer—again, to account for the natural time cycle of the production process, use as the comparison set for similarity the current year as well as the two years before the current year. 
+
+Create a figure that illustrates how the distance between a producer and the other producers it works with relates to the number of new keywords a producer introduces each year. 
+
+A useful way to do this is by using a “loess” smoother that plots a flexible trend line that illustrates the level of a variable on the y-axis at different levels of a variable on the xaxis. Loess stands for “locally estimated scatterplot smoothing”—it fits a locally-weighted regression line over the underlying scatterplot, so it provides a tool to observe nonlinear relationships between the two variables.
+
+You can set up a loess plot using the ggplot2 package and running a command of the form
+
+ggplot(data, aes(average Jaccard distance, new keywords)) + geom_smooth(method = "loess", se = T) + labs(x = "Average Jaccard distance", y = "New keywords")) You can also export the plot quickly to pdf using ggplot2’s functionality
+ggsave("loess_new_keywords.pdf", width = 7, height = 7, units = "in") which lets you control the size of the pdf that is saved.
+
+What does the pattern suggest about what kinds of collaborative partnerships might result in more creative innovation? Does this help to explain the results from Question 1?
+```{r}
+#As I have discussed above, I unfortunately did not have enough time to calculate the Jaccard Distance. If I were to tackle this question, I would use the Keywords dataset to create an empty matrix of nrow(unique(pcindex)) by nrow(unique(keywords)), then fill it out using a loop that cycles through all the different keywords, assigning a value of 1 (or True) where the producer made a firm with the keyword of that specific loop. I would then make a list of these matrices, with one matrix for each year to get a by year dataset. Had I caluclated the Jaccard distances, I would then calculate the average Jaccard per producer per year. With the data prep ready, I would create a graph of this using ggplot, with a function similar to the one below:
+
+#ggplot(Dataset, aes('Calculated Average Jaccard Distance', 'List of New Keywords')) + geom_smooth(method = "loess", se = T) + labs(x = "Average Jaccard Distance", y = "New keywords")).
+
+#Visually inspecting the graph, a positve slope would tell us that higher distance values between producers will give us more keywords, while the opposite will be true if the slope is negative. Intuitively, the positve correlation effect should be true, as distant producers should have very different information and ideas, which should support the creation of more unique, innovative or new ideas should they come together and collaborate. 
+```
+
+3. Next, let’s analyze whether collaborations influence a production company’s financial returns. Since the budget information is so sparse, we will use the theater screens release coverage as a proxy for how much producers spend on each film that they make. Define each producer’s yearly return as its yearly box office revenue divided by the total release coverage it invested in for that year for its films.
+
+To be able to make comparisons more equally across the years of the data, we’ll normalize each producer’s box office return compared to the returns that all producers earned that year. To do this, subtract the mean return of all producers for that year from a producer’s individual return and divide it by the standard deviation of the returns for all producers that year:
+
+standardized returnit = (returnit − mean returnt) / standard deviation returnt, for each producer i in each year t.
+
+Estimate a regression predicting producers’ standardized return using the core-periphery classification to define generalists and specialists. Use the same controls as in Question 1. Since the outcome is not a count, you can estimate this model with
+
+lm(standardized return ∼ Central co-productions + Peripheral co-productions + Hybrid co-productions + Coordinate 1 + Coordinate 2 + Total box office + Number of years in operation + Is subsidiary + factor(year), data)
+
+What do the results suggest about financial outcomes for collaborations
+
+```{r}
+#We will first calculate the producers' returns by combining our monster dataframe with the Box Office Dataset. We then derive the return every year, as well as some simple statistics (mean & std. deviation). We lastly use all these to calculate the standardized return for each producer per year.
+CombinedQ3 <- left_join(Combined2, Box[,c(1,3,4)])
+CombinedQ3 <- CombinedQ3 %>% mutate(return = ifelse(release_coverage==0,NA,total_box / release_coverage))
+CombinedQ3 <- CombinedQ3[!is.na(CombinedQ3$return),]
+CombinedQ3 <- CombinedQ3 %>% group_by(year) %>% mutate(mean = mean(return), sd = sd(return))
+CombinedQ3 <- CombinedQ3 %>% group_by(year, pcindex) %>% mutate(st_return = (return - mean)/sd)
+```
+
+```{r}
+#With everything ready, we can now run a regression to predict total return for generalist defined by top 25% of all Producers by number of new films made per year.
+Model3 <- lm(st_return ~ CentralCoDef1Sum + PeripheralCoDef1Sum + HybridCoDef1Sum + total_box + years_old + IsSubsid + factor(year), CombinedQ3)
+summary(Model3)
+```
+
+```{r}
+#I will discuss the results of this prediction model together with the results of the prediciton model of the second generalist definition below:
+```
+
+```{r}
+#With everything ready, we can now run a regression to predict total return for generalist defined by top 25% of all Producers by eigen centrality.
+Model4 <- lm(st_return ~ CentralCoDef2Sum + PeripheralCoDef2Sum + HybridCoDef2Sum + total_box + years_old + IsSubsid + factor(year), CombinedQ3)
+summary(Model4)
+```
+
+```{r}
+#For our first generalist definition, we see that peripheral collaborations are positively correlated with returns, while hybrid and central collaborations are negatively correlated with returns. With this being said, collaborations overall are positively correlated with returns, as the total average of the coefficient of the three types of collaborations is positive. This tells us that peripheral collaborations typically make more money while hybrid and central collaborations typically make less money, but collaborations overall typically make more money than no-collaborations.
+
+#Moving onto our second generalist definition, we can see that a similar story is told. Again, peripheral collaborations bring in more return while hybrid and central collaborations bring in less return. Again, collaborations overall bring in more return than no-collaboration, as again the total average coefficient of the three types of collaborations is positive. 
+
+#I suppuose the moral of the story is to collaborate, but try to do so with peripheral producers. 
+```
+
+4. Collaborations can be financially risky because of the coordination required to integrate multiple producers’ experiences into a making new film. Do producers gain anything from these collaborations creatively or financially in the long term?
+
+(A) Estimate a regression predicting the count of new keywords introduced in a producer’s solo produced films in a year.
+
+Use as a predictor the cumulative number of new keywords a producer has introduced in all of its films through the current year that were made in “hybrid” collaborations. 
+
+Use the same set of controls as in Questions 1 and 2. The outcome is a count, so use glm.nb().
+
+Does creative innovation gained through collaborations make a producer’s solo-produced films more innovative? What does this suggest?
+```{r}
+#We first make a copy of our monster dataset
+CombinedQ4 <- CombinedQ3
+
+#We then calculate the number of solo and hybrid productions of each firm each year in order to make an estimation on the total number of keywords a producer brings to a company's solo productions.
+CombinedQ4 <- CombinedQ4 %>% group_by(pcindex, year, co_or_solo) %>% mutate(solo_keywords = ifelse(co_or_solo=="Solo", sum(SumNew), 0))
+
+CombinedQ4 <- CombinedQ4 %>% arrange(year) %>% group_by(pcindex, TypeDef1) %>% mutate(cum_hy_keywords1 = ifelse(TypeDef1 == "Hybrid Co-prod", cumsum(SumNew), 0))
+
+CombinedQ4 <- CombinedQ4 %>% arrange(year) %>% group_by(pcindex, TypeDef2) %>% mutate(cum_hy_keywords2 = ifelse(TypeDef2 == "Hybrid Co-prod", cumsum(SumNew), 0))
+
+CombinedQ4 <- CombinedQ4 %>% group_by(year, pcindex) %>% mutate(prod_revenue = sum(total_box))
+```
+
+```{r}
+#With the numbers crunched, we can now run the regressions just like questions 1 and 3:
+#Regression for generalist defined by top 25% of all Producers by number of new films made per year.
+Model5 <- glm.nb(solo_keywords ~ cum_hy_keywords1 + CentralCoDef1Sum + PeripheralCoDef1Sum + HybridCoDef1Sum + IsSubsid + prod_revenue + years_old + factor(year), CombinedQ4, offset(NumFilms))
+summary(Model5)
+```
+```{r}
+#Once again, I will discuss the results of this with the results of the second definition of Generalist below:
+```
+
+```{r}
+#Regression for generalist defined by top 25% of all Producers by eigen centrality.
+Model6 <- glm.nb(solo_keywords ~ cum_hy_keywords2 + CentralCoDef2Sum + PeripheralCoDef2Sum + HybridCoDef2Sum + IsSubsid + prod_revenue + years_old + factor(year), CombinedQ4, offset(NumFilms))
+summary(Model6)
+```
+
+```{r}
+#Looking at the results of both regression for both definitions, we can comfortably say that any and all types of collaborations reduce the total number of new keywords in solo produced films across the board. This intuitively makes sense, as problems such as groupthink can occur when collaborations happen, while individual firm brainstorming typically should drive new and innovative keywords.
+```
+(B) Accounting for a producer’s engaging in collaborations, does introducing new keywords result in higher box office returns? 
+
+To gain insight into this, estimate the same regression model from Question 2, but add in a predictor for the number of new keywords introduced.
+
+Does this result help explain why producers might engage in collaborations, even though they can be financially risky?
+```{r}
+#As I was unable to complete question 2, I was unable to complete this part either. 
+```
+
+Extra Credit (2 points)
+We also have information about the people that work on films as cast members. These include actors, writers, directors, and other kinds of creative talent. The file “film_cast_members.csv” contains a unique key identifying the creative talent and describes what role they worked on as a member of the cast of each film.
+
+One way that production companies might benefit from collaborating with one another is that it helps them hire more innovative creative talent to work on their films.
+
+Define a cast member’s innovativeness as the cumulative number of new keywords created in the films that they have worked on in their career up to the prior year. Using the scale-based classification to define generalists and specialists, estimate a regression predicting the innovativeness of the hired creative talent based on the types of collaborations a production company engages in.
+
+Does engaging in more hybrid collaborations seem to help with hiring more innovative creative talent?
+```{r}
+#Let's start by calculating the innovativeness of the cast by calculating the total number of new words for each move that they are in per year. Keep in mind that we will have to lag this by 1
+
+ExtraCredit <- left_join(CombinedQ4, Cast)
+ExtraCredit <- ExtraCredit[!is.na(ExtraCredit$SumNew),]
+ExtraCredit <- ExtraCredit %>% group_by(nconst) %>% arrange(nconst, year) %>% mutate(InnovativeCast = cumsum(coalesce(SumNew)))
+ExtraCredit <- ExtraCredit %>% group_by(nconst) %>% mutate(InnovationLag = lag(InnovativeCast, 1))
+
+#We finish data prep for the extra credit by grouping our dataset by the movie ID, which will help us find the total innovativeness of the entire cast for every movie:
+ExtraCredit <- ExtraCredit %>% group_by(pindex) %>% mutate(InnovativeMovie = sum(InnovativeCast, na.rm=TRUE))
+```
+
+```{r}
+#We can now run 2 regressions, one for each definition of generalist.
+
+#Regression for generalist defined by top 25% of all Producers by number of new films made per year.
+Model7 <- glm.nb(InnovativeMovie ~ CentralCoDef1Sum + PeripheralCoDef1Sum + HybridCoDef1Sum, ExtraCredit)
+summary(Model7)
+```
+```{r}
+#Once again, I will discuss the results of this with the results of the second definition of Generalist below:
+```
+
+```{r}
+#Regression for generalist defined by top 25% of all Producers by eigen centrality.
+Model8 <- glm.nb(InnovativeMovie ~ CentralCoDef2Sum + PeripheralCoDef2Sum + HybridCoDef2Sum, ExtraCredit)
+summary(Model8)
+```
+```{r}
+#Looking at the results, we can see that only hybrid co-productions are positively correlated with innovativeness when we define generalist by the first definition, while only central co-productions are positively correlated with innovativeness when we define generalist by the second definition. Not much intuitive conclusion can be drawn from these results. :( 
+```
+
