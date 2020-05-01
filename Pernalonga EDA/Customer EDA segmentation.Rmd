@@ -1,0 +1,89 @@
+---
+title: "R Notebook"
+
+```{r}
+#install.packages('factoextra')
+library(psych)
+library(data.table)
+library(dplyr)
+library(mltools)
+library(cluster)
+library(factoextra)
+library(dplyr)
+library(data.table)
+library(stats)
+library(purrr)
+library(cluster)
+library(factoextra)
+library(gtools)
+library(igraph)
+library(dplyr)
+library(data.table)
+library(stats)
+library(purrr)
+library(cluster)
+library(factoextra)
+library(gtools)
+library(igraph)
+```
+
+
+
+```{r}
+setwd("e:/Downloads/Marketing")
+product <- fread('product_table.csv')
+transaction <- fread('transaction_table.csv')
+transaction <- transaction %>% filter (tran_prod_paid_amt >= 0)
+# check missing value
+str(transaction)
+sapply(transaction,function(x) sum(is.na(x)))
+sapply(product,function(x) sum(is.na(x)))
+# Joining tables and create new transaction id 
+transaction_product <- inner_join(transaction,product, by="prod_id")
+transaction_product$new_tran_id <- paste(as.character(transaction_product$tran_dt),as.character(transaction_product$store_id),as.character(transaction_product$cust_id),sep="")
+```
+
+
+Who are the best customers in terms of revenues, profits, transactions/store visits, number of products, etc.?
+```{r}
+# question 1
+transaction_product=as.data.table(transaction_product)
+unique(transaction_product[,.(cust_id)]) # 7920 distinct customers
+transaction_product[,sum(tran_prod_paid_amt),cust_id][order(V1,decreasing = T)][c(1:792),sum(V1)] # revenues, top 10%
+```
+
+DT[, Mean:=mean(X), by=list(Y, Z)]
+
+# revenues, top 10%
+transaction_product[,revenue:=sum(tran_prod_paid_amt),by=cust_id][order(revenue,decreasing = T)]
+unique(transaction_product[,list(id,revenue)])
+# transactions, top 10%
+transactioncustomers=transaction_product[,transaction:=length(unique(tran_id)),cust_id][order(transaction,decreasing = T)][c(1:792),] 
+# discounts, top 10%
+discountcustomers=transaction_product[,discount:=sum(tran_prod_discount_amt)/sum(tran_prod_paid_amt+tran_prod_discount_amt+tran_prod_sale_amt),cust_id][order(discount)][c(1:792),]
+# number of products, top 10%
+transaction_product[prod_unit=='CT',sum(tran_prod_sale_qty),cust_id][order(V1,decreasing = T)][c(1:792),sum(V1)] # number of products in CT, top 10%
+transaction_product[prod_unit=='KG',sum(tran_prod_sale_qty),cust_id][order(V1,decreasing = T)][c(1:792),sum(V1)] # number of products in KG, top 10%
+```
+
+
+```{r}
+revenuecustomers
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

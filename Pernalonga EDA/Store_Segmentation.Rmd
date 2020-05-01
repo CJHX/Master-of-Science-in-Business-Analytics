@@ -1,0 +1,157 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(dplyr)
+library(data.table)
+library(stats)
+library(purrr)
+library(cluster)
+library(factoextra)
+library(gtools)
+library(igraph)
+library(psych)
+setwd("C:/Users/Jie Z/Downloads/MKT")
+product <- fread('product_table.csv')
+transaction <- fread('transaction_table.csv')
+```
+
+```{r}
+transaction <- transaction %>% filter(tran_prod_paid_amt > 0)
+```
+
+```{r}
+# check missing value
+str(transaction)
+sapply(transaction,function(x) sum(is.na(x)))
+sapply(product,function(x) sum(is.na(x)))
+```
+
+
+```{r}
+# Joining tables and create new transaction id ---------------------------------------
+transaction_product <- inner_join(transaction,product, by="prod_id")
+transaction_product$new_tran_id <- paste(as.character(transaction_product$tran_dt),as.character(transaction_product$store_id),as.character(transaction_product$cust_id),sep="")
+```
+
+## Dataset Understanding
+
+```{r}
+summary(transaction)
+describe(transaction)
+```
+
+
+
+## Question 3: Which stores rank the highest in volumes, revenues, profits, transactions, customers, etc.?
+
+```{r}
+# Stores with the highest volumes (by count)
+store_vol_count <- transaction %>% 
+  filter(prod_unit == 'CT') %>% 
+  group_by(store_id) %>%
+  summarize(total_vol = sum(tran_prod_sale_qty)) %>%
+  arrange(desc(total_vol))
+head(store_vol_count, 10)
+
+# Stores with the highest volumes (by kilograms)
+store_vol_kg <- transaction %>% 
+  filter(prod_unit == 'KG') %>% 
+  group_by(store_id) %>%
+  summarize(total_vol = sum(tran_prod_sale_qty)) %>%
+  arrange(desc(total_vol))
+head(store_vol_kg, 10)
+
+# Stores with the highest revenues
+store_revenue <- transaction %>% 
+  group_by(store_id) %>%
+  summarize(total_revenue = sum(tran_prod_paid_amt)) %>%
+  arrange(desc(total_revenue))
+head(store_revenue, 10)
+
+# Stores with the highest transactions
+store_tran <- transaction_product %>% 
+  group_by(store_id) %>%
+  summarize(total_tran = n_distinct(new_tran_id)) %>%
+  arrange(desc(total_tran))
+head(store_tran, 10)
+
+# Stores with the highest customers
+store_cust <- transaction %>% 
+  group_by(store_id) %>%
+  summarize(total_cust = n_distinct(cust_id)) %>%
+  arrange(desc(total_cust))
+head(store_cust, 10)
+
+```
+
+## % of Total Revenue - % of Stores
+
+```{r}
+plot((1:nrow(store_revenue))/nrow(store_revenue), cumsum(store_revenue$total_revenue)/sum(store_revenue$total_revenue),xlab="Percentage of Stores", ylab="Percentage of Total Revenue")
+abline(v=0.2,lty='dotted')
+```
+
+## Question 6: Are there natural groupings of stores, e.g., stores frequented by cherry-pickers versus stores visited by most loyal customers?
+
+```{r}
+store_stat <- transaction_product %>%
+  group_by(store_id) %>%
+  summarize(total_revenue = sum(tran_prod_paid_amt), total_customer = n_distinct(cust_id), total_product = n_distinct(prod_id), avg_discount_rate = -sum(tran_prod_discount_amt)/sum(tran_prod_paid_amt), avg_transaction_amt = sum(tran_prod_paid_amt)/n_distinct(new_tran_id), avg_visit = n_distinct(new_tran_id)/n_distinct(cust_id), transaction = n_distinct(new_tran_id)) %>%
+  filter(transaction >= 100)
+
+store_original <- store_stat
+
+summary(store_stat)
+describe(store_stat)
+```
+
+```{r}
+## k-means
+### min-max data standardization
+minmax <- function(x){(x-min(x))/diff(range(x))}
+store_stat$total_revenue <- minmax(store_stat$total_revenue)
+store_stat$total_customer <- minmax(store_stat$total_customer)
+store_stat$total_product <- minmax(store_stat$total_product)
+store_stat$avg_discount_rate <- minmax(store_stat$avg_discount_rate)
+store_stat$avg_transaction_amt <- minmax(store_stat$avg_transaction_amt)
+store_stat$avg_visit <- minmax(store_stat$avg_visit)
+
+summary(store_stat)
+```
+
+```{r}
+### use two different methods to determine the optimal value of k
+fviz_nbclust(store_stat[, 2:7], kmeans, method = "wss", k.max = 15) +
+geom_vline(xintercept = 4, linetype = 2)  # a measure of the variability of the observations within each cluster
+fviz_nbclust(store_stat[, 2:7], kmeans, method = "silhouette", k.max = 15)# a measure of how similar an object is to its own cluster
+```
+
+```{r}
+set.seed(4) 
+clusters <- kmeans(store_stat[, 2:7], 4)
+str(clusters)
+clusters$centers
+table(clusters$cluster)
+```
+
+```{r}
+store_stat$cluster <- clusters$cluster
+store_original$cluster <- clusters$cluster
+```
+
+```{r}
+store_all <- store_original %>% 
+  group_by(cluster) %>%
+  summarize(avg_total_revenue = mean(total_revenue), avg_total_customer = mean(total_customer), avg_total_product = mean(total_product), avg_discount_rate_all = mean(avg_discount_rate), avg_transaction_amt_all = mean(avg_transaction_amt), avg_visit_all = mean(avg_visit), num_store = n())
+
+store_all
+describe(store_original[store_original$cluster==1,])
+describe(store_original[store_original$cluster==2,])
+describe(store_original[store_original$cluster==3,])
+describe(store_original[store_original$cluster==4,])
+```
+
