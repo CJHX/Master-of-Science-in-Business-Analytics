@@ -1,0 +1,557 @@
+---
+title: "Marketing Mix Model"
+output: html_notebook
+Author: Team 4
+---
+
+## 1.Read the dataset
+```{r, warning=FALSE, message=FALSE}
+setwd("C:/Users/Frank/Desktop/Project 4")
+library(data.table)
+library(dummies)
+library(lmtest)
+library(MLmetrics)
+library(dummies)
+library(zoo)
+library(ggplot2)
+library(reshape)
+library(car)
+library(lmtest)
+
+product = fread("product_table_supp.csv", header = TRUE)
+trans = fread("transaction_table_supp.csv", header = TRUE)
+promo = fread('promo_ad.csv', header = TRUE)
+hol = fread('holiday.csv', header = TRUE)
+seasonality = fread('seasonality.csv', header = TRUE)
+
+# Let's check the three products which will be focused : 138936953 138936952 138936951
+unique(trans$prod_id)
+```
+
+## 2. Data Preparation - TV and Radio
+In the following code, we took two steps:
+1. We calculated alpha for both TV and Radio.
+2. We calculated adstocked GRP for TV and Radio respectively; A key assumption is that there are no adstocked GRP left before the first promotion in this period
+3. We transformd the adstocked GRP to reach before putting it in the regression. 
+```{r}
+# Because Pernalonga have promotions every week (we have checked), we can directly get a list of week index from the promo_ad dataset: there are 106 weeks in total.
+week = data.table(as.Date(unique(promo$tran_wk)))
+promo$tran_wk = as.Date(promo$tran_wk)
+colnames(week) <- 'tran_wk'
+week$tran_wk = as.Date(week$tran_wk)
+
+# We calculated alpha for both TV and Radio. TV has 8-week half life; Radio has 4-week half life.
+alpha_TV = 1 - 0.5 ** (1 / 8) # Around 0.16
+alpha_Radio = 1 - 0.5 ** (1 / 4) # Around 0.08
+
+# Here we also confirmed that all TV and Radio promotions are targeted towards all three products
+unique(promo[promo$vehicle == 'TV', prod_assoc])
+unique(promo[promo$vehicle == 'Radio', prod_assoc])
+
+# First we initialized a table called TV_adstock, which were used to store adstocked GRP of TV
+TV_adstock = merge(week, promo[promo$vehicle == 'TV'], by = 'tran_wk', all.x = TRUE)
+TV_adstock = TV_adstock[TV_adstock$tran_wk >= '2016-06-05'] # A key assumption is that there are no adstocked GRP left before the first promotion in this period.
+TV_adstock$tran_wk = as.Date(TV_adstock$tran_wk)
+TV_adstock[is.na(TV_adstock$amount), amount := 0] # We transformed missing value to zero for calculation.
+TV_adstock$adstock = 0
+
+# Then, we used the half life provided to adstock the GRP with missing weeks filled in. 
+for (wk in as.character(TV_adstock$tran_wk)) {
+    if (wk == '2016-06-05') {
+        TV_adstock[TV_adstock$tran_wk == wk, adstock := alpha_TV * amount]
+        last_adstock <- TV_adstock[TV_adstock$tran_wk == wk, adstock]
+    } else {
+        grp <- TV_adstock[TV_adstock$tran_wk == wk, amount]
+        adstocked_grp <- (1 - alpha_TV) * last_adstock + alpha_TV * grp
+        TV_adstock[TV_adstock$tran_wk == wk, 'adstock'] <- adstocked_grp
+        last_adstock <- TV_adstock[TV_adstock$tran_wk == wk, adstock]
+    }
+}
+
+# Last, we converted adstocked GRP to reach, which would be used as causal in regression 
+TV_adstock[, reach := 0.95 * (1 - exp(-0.02 * adstock))]
+
+# Let's take a look!
+TV_adstock
+```
+
+```{r}
+# Similarly, we first initialized a table called Radio_adstock, which were used to store adstocked GRP of radio
+Radio_adstock = merge(week, promo[promo$vehicle == 'Radio'], by = 'tran_wk', all.x = TRUE)
+Radio_adstock = Radio_adstock[Radio_adstock$tran_wk >= '2016-06-05'] # A key assumption is that there are no adstocked GRP left before the first promotion in this period.
+Radio_adstock[is.na(Radio_adstock$amount), amount := 0] # We transformed missing value to zero for calculation.
+Radio_adstock$adstock = 0
+
+# Then, we used the half life provided to adstock the GRP with missing weeks filled in. 
+for (wk in as.character(Radio_adstock$tran_wk)) {
+    if (wk == '2016-06-05') {
+        Radio_adstock[Radio_adstock$tran_wk == wk, adstock := alpha_Radio * amount]
+        last_adstock <- Radio_adstock[Radio_adstock$tran_wk == wk, adstock]
+    } else {
+        grp <- Radio_adstock[Radio_adstock$tran_wk == wk, amount]
+        adstocked_grp <- (1 - alpha_Radio) * last_adstock + alpha_Radio * grp
+        Radio_adstock[Radio_adstock$tran_wk == wk, 'adstock'] <- adstocked_grp
+        last_adstock <- Radio_adstock[Radio_adstock$tran_wk == wk, adstock]
+    }
+}
+
+# Last, we converted adstocked GRP to reach, which would be used as causal in regression 
+Radio_adstock[, reach := 0.9 * (1 - exp(-0.025 * adstock))] # convert adstocked GRP to reach
+
+# Let's take a look!
+Radio_adstock
+```
+
+## 2. Data Preparation - Other Causals
+### Promotion and List Price
+```{r}
+# First, we tool all the relevant information from the transaction table, including sales quantity, discount and price.
+model_data <- trans[, .(tran_dt, prod_id, tran_prod_sale_amt, tran_prod_sale_qty, tran_prod_discount_amt, prod_unit_price)]
+model_data$tran_dt = as.Date(model_data$tran_dt)
+week$week = week$tran_wk
+
+# We also need merge it back to the week table to get aggregated weekly data.
+model_data = merge(model_data, week, by.x = 'tran_dt', by.y = 'tran_wk', all.x = TRUE, all.y = TRUE)
+model_data = model_data[model_data$tran_dt > '2015-12-27']
+model_data$week = as.character(model_data$week)
+
+# Then we just calculated weekly list price and weekly discount for each product.
+model_data = model_data[order(tran_dt)]
+model_data[model_data$tran_dt <= '2016-01-02', week := '2015-12-27']
+model_data$week = na.locf(na.locf(model_data$week))
+model_data[, weekly_price := sum(tran_prod_sale_amt) / sum(tran_prod_sale_qty), by = .(week, prod_id)]
+model_data[, weekly_discount := sum(tran_prod_discount_amt) / sum(tran_prod_sale_qty), by = .(week, prod_id)]
+
+# Let's take a look at weely_price and weekly_discount, which will be used as causals in regression model.
+model_data
+```
+
+
+### Seasonality and Holiday
+The following code took three steps:
+1. Add seasonality to model data;
+2. Add holiday indicator to model data;
+3. Because we found that products have a pattern of high sales around the end of each year, we also add important holiday indicator (Christmas and New Year's Day) to our model data.
+```{r}
+# First, we simply merged the seasonality data table. Seasonality index will be used as causal too.
+model_data = merge(model_data, seasonality, by.x = 'week', by.y = 'tran_wk')
+
+# And before we could merged the holiday data into model data, we found that different holidays have different effects are sales (not all positive). Let's take a look.
+ggplot(model_data[model_data$prod_id == 138936953, list(sales = sum(tran_prod_sale_amt)), by = week], aes(x = week, y = sales)) + geom_point()
+
+# We believe this pattern is caused by Christmas and New Year's Day. A possible reason is that on important holidays people tend to drink more high-end beverages such as wine. So we decided to add big holiday indicator (Christmas and New Year's Day) to our model.
+hol[hol$holiday=='NEWYEAR', big_holiday := 1]
+hol[is.na(big_holiday), big_holiday := 0]
+
+# Here we just used holiday as an indicator for other holidays.
+hol[, holiday := 1]
+hol[big_holiday == 1, holiday := 0]
+hol = unique(hol)
+
+# Finally we merged the holiday data table to model data.
+model_data = merge(model_data, hol, all.x = TRUE, by.x = 'week', by.y = 'tran_wk')
+model_data[is.na(holiday), holiday := 0]
+model_data[is.na(big_holiday), big_holiday := 0]
+model_data = model_data[, list(sales_qty = sum(tran_prod_sale_qty)),
+     by = .(week, prod_id, seas_index, holiday, big_holiday, weekly_price, weekly_discount)]
+model_data[, list(count = .N), by = prod_id]
+
+# Let's take a look at 'holiday' and 'big_holiday', which will be used as causals in regression model.
+model_data
+```
+
+### Flyer, Store Display, Email, Web Display, Paid Search
+In the following code, we finally prepared the model data for three products:
+1. We divided the model data into three products, because they will be modeled seperately.
+2. We merged the original model data with Flyer, Store Display, Email, Web Display, Paid Search information.
+3. We also transformed y, because we assume that we will build multiplicative models and logit models.
+
+```{r}
+a = 0
+for (product in c('138936951','138936952','138936953')){
+    a=a+1
+    
+    # Using for-loop, we divided the model data into three products, because they will be modeled seperately.
+    model = model_data[prod_id == product]
+    
+    # Then we merged model data with the promotion data and TV/Radio reach data that we have prepared.
+    promotion_data = promo[(prod_assoc %in% c('ALL', as.character(product))) & (!(vehicle %in% c('TV', 'Radio'))), .(tran_wk, vehicle, amount)]
+    
+    # Add Flyer, Store Display, Email, Web Display, Paid Search information from promotion data
+    unique(promotion_data$vehicle)
+    promotion_data = cast(promotion_data, form = tran_wk ~ vehicle, value = 'amount')
+    promotion_data$tran_wk = as.Date(promotion_data$tran_wk)
+    model$week = as.Date(model$week)
+    model = merge(model, promotion_data, by.x = 'week', by.y = 'tran_wk')
+    
+    # Add TV, Radio information from TV_adstock and Radio_adstock
+    model = merge(model, TV_adstock[, .(tran_wk, reach)], all.x = TRUE, by.x = 'week', by.y = 'tran_wk')
+    colnames(model)[colnames(model) == 'reach'] <- 'TV'
+    model = merge(model, Radio_adstock[, .(tran_wk, reach)], all.x = TRUE, by.x = 'week', by.y = 'tran_wk')
+    colnames(model)[colnames(model) == 'reach'] <- 'Radio'
+    
+    # Here we also generated a new column called base price, which is just the earliest price in the time period.
+    model$base_price <- model[week == '2015-12-27', weekly_price]
+    
+    # To build multiplicative models, we transformed y to log form.
+    model[, sales_log := log(sales_qty)]
+    
+    # To build future logit models, we transformed y. Here we assume that the maximum sales quantity is 10% more than historical maximum.
+    # In this way, the target will be positively inside logarithm.
+    model[, max_sales_qty := max(sales_qty) * 1.1]
+    model[, sales_trfm := log(sales_qty / (max_sales_qty - sales_qty))]
+    model[is.na(model)] <- 0
+    assign(paste('model', a, sep = "_"),model)}
+
+colnames(model_1) <- c("week", "prod_id", "seasonality", "holiday", "big_holiday", "weekly_price", "weekly_discount", "sales_amount", "Email", "Flyer", "Paid_Search", "Web_Display", "TV", "Radio", "base_price",  "sales_log","max_sales_qty", "sales_transformed")    
+colnames(model_2) <- c("week", "prod_id", "seasonality", "holiday", "big_holiday", "weekly_price", "weekly_discount", "sales_amount", "Email", "Flyer", "Paid_Search", "Store_Display", "Web_Display", "TV", "Radio", "base_price", "sales_log", "max_sales_qty", "sales_transformed")
+colnames(model_3) <- c("week", "prod_id", "seasonality", "holiday", "big_holiday", "weekly_price", "weekly_discount", "sales_amount", "Email", "Flyer", "Paid_Search", "Store_Display", "Web_Display", "TV", "Radio", "base_price", "sales_log", "max_sales_qty","sales_transformed")    
+
+#Let's take a look at model data for the first product:
+model_1
+```
+
+## 3. Modelling
+For each product, we build multiplicative model and logit model respectively, so that we can choose the one that better explain our causals.
+### First we tried to build linear regression models with raw data and all available variables, and we discovered that some of the coefficients are negative. In the following code chunk, we demonstrated an example using logit model for product I.
+```{r}
+# Product 138936951 logit model with raw data and all available variables
+prod1_logit <- lm(sales_transformed ~ weekly_price + weekly_discount + Flyer + Email + Web_Display + Paid_Search + TV + Radio + seasonality + holiday +
+                    big_holiday, data=model_1)
+summary(prod1_logit)
+```
+From the above results, we can see that some of the coefficients are negative, which is contradictory to our business understanding and domain knowledge. All marketing vehicles should have a non-negative effect on sales. So we have taken the following steps:
+
+### 1. We checked the correlation between causals and the target variable (the code uses product 1 as an example)
+```{r}
+# Check correlaitons with target variables
+model_1[,c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' ,'holiday', 'big_holiday')] =lapply(model_1[, c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' ,'holiday' , 'big_holiday')], as.numeric)
+cor(model_1[,c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' , 'holiday' , 'big_holiday')])[,1]
+
+# model_2[,c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' ,'holiday', 'big_holiday')] =lapply(model_2[, c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' ,'holiday' , 'big_holiday')], as.numeric)
+# cor(model_2[,c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' , 'holiday' , 'big_holiday')])
+
+# model_3[,c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' ,'holiday', 'big_holiday')] =lapply(model_3[, c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' ,'holiday' , 'big_holiday')], as.numeric)
+# cor(model_3[,c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' , 'holiday' , 'big_holiday')])
+```
+
+### 2. From the correlation above correlation, we can see that some marketing vehicles have a negative correlation with sales. We believe this phenomenon is caused by outliers. So, we removed outliers and tried again in the below code:
+```{r}
+# Dealing with outliers to get the right direction of coefficients
+model_1 = model_1[model_1$sales_amount>= mean(model_1$sales_amount)-3*sd(model_1$sales_amount),]
+model_2 = model_2[model_2$sales_amount>= mean(model_3$sales_amount)-3*sd(model_2$sales_amount),]
+model_3 = model_3[model_3$sales_amount>= mean(model_3$sales_amount)-3*sd(model_3$sales_amount),]
+
+# Check correlations again
+cor(model_1[,c('sales_amount','weekly_price','weekly_discount','Flyer', 'Email', 'Web_Display', 'Paid_Search', 'TV', 'Radio', 'seasonality' , 'holiday' , 'big_holiday')])[,1]
+
+# All correlations except weekly price have become postive!
+```
+All correlations except weekly price have become postive after we removed outliers!
+
+### 3. We used data without outliers to build regression models. In the following code, we built both a multiplicative model and a logit model for each product so that we can choose the better one for each product. Also, we decided to use constrained least squares regression to ensure all the coefficients are non-negative.
+
+```{r}
+# Product 138936951 multiplicative model
+library(colf)
+prod1_mul <- colf_nls(sales_log ~ weekly_price + weekly_discount + Flyer + Email + Web_Display + Paid_Search + TV + Radio + seasonality + holiday +
+                    big_holiday, lower = c(-Inf,-Inf,0,0,0,0,0,0,0,0,0,0), data=model_1)
+summary(prod1_mul)
+# Product 138936951 logit model
+prod1_logit <- colf_nls(sales_transformed ~ weekly_price + weekly_discount + Flyer + Email + Web_Display + Paid_Search + TV + Radio + seasonality + holiday +
+                    big_holiday,lower = c(-Inf,-Inf,0,0,0,0,0,0,0,0,0,0), data=model_1)
+summary(prod1_logit)
+
+
+# Product 13893692 multiplicative model
+prod2_mul <- colf_nls(sales_log ~ weekly_price + weekly_discount + Flyer + Email + Web_Display + Store_Display +Paid_Search + TV + Radio + seasonality + holiday + big_holiday,lower = c(-Inf,-Inf,0,0,0,0,0,0,0,0,0,0),  data=model_2)
+summary(prod2_mul)
+# Product 138936951 logit model
+prod2_logit <- colf_nls(sales_transformed ~ weekly_price + weekly_discount + Flyer + Email + Web_Display+ Store_Display  + Paid_Search + TV + Radio + seasonality + holiday + big_holiday,lower = c(-Inf,-Inf,0,0,0,0,0,0,0,0,0,0,0), data=model_2)
+summary(prod2_logit)
+
+
+# Product 138936953 multiplicative model
+prod3_mul <- colf_nls(sales_log ~ weekly_price + weekly_discount + as.factor(Flyer) + Email + Web_Display + Store_Display + Paid_Search + TV + Radio + seasonality + holiday +
+                    big_holiday, lower = c(-Inf,-Inf,0,0,0,0,0,0,0,0,0,0), data=model_3)
+summary(prod3_mul)
+# Product 138936953 logit model
+prod3_logit <- colf_nls(sales_transformed ~ weekly_price + weekly_discount + Flyer + Email + Web_Display + Store_Display + Paid_Search + TV + Radio + seasonality + holiday +
+                    big_holiday,lower = c(-Inf,-Inf,0,0,0,0,0,0,0,0,0,0,0), data=model_3)
+summary(prod3_logit)
+```
+
+
+## 4. Model Diagnostics
+After dealing with unreasonable coefficients by removing outliers and using constrained regressions, we have built six models in totol: a multiplicative model and a logit model for each product. The following step is to run a comprehensive model diagnostics for all models and choose the better performed model for each product. 
+In the following code, we reviewd the R^2, adjusted R^2, MAPE, F statistic and Durbin Watson Statistic to compare and valid the models.
+```{r}
+diagnostics <- data.frame("model" = c("prod1_mul", "prod1_logit", "prod2_mul", "prod2_logit", "prod3_mul", "prod3_logit"))
+a=0
+for (model in list(prod1_mul, prod1_logit, prod2_mul, prod2_logit,prod3_mul, prod3_logit)){
+    a = a+1
+    if(a==1){
+        prediction = exp(fitted(model))
+        true = model_1$sales_amount
+        p <- 9 # number of predictors
+        n <- nrow(model_1) # number of observations
+    }else if(a==2){
+        max_sales_qty = unique(model_1$max_sales_qty)
+        prediction = max_sales_qty * exp(fitted(model)) / (exp(fitted(model)) + 1)
+        true = model_1$sales_amount
+        p <- 10 # number of predictors
+        n <- nrow(model_1) # number of observations
+    }else if(a==3){
+        prediction = exp(fitted(model))
+        true = model_2$sales_amount
+        p <- 10 # number of predictors
+        n <- nrow(model_2) # number of observations
+    }else if(a==4){
+        max_sales_qty = unique(model_2$max_sales_qty)
+        prediction = max_sales_qty * exp(fitted(model)) / (exp(fitted(model)) + 1)
+        true = model_2$sales_amount
+        p <- 10 # number of predictors
+        n <- nrow(model_2) # number of observations
+    }else if(a==5){
+        prediction = exp(fitted(model))
+        true = model_3$sales_amount
+        p <- 10 # number of predictors
+        n <- nrow(model_3) # number of observations
+    }else if(a==6){
+        max_sales_qty = unique(model_3$max_sales_qty)
+        prediction = max_sales_qty * exp(fitted(model)) / (exp(fitted(model)) + 1)
+        true = model_3$sales_amount
+        p <- 10 # number of predictors
+        n <- nrow(model_3) # number of observations
+    }
+    rss = sum((prediction - true) ^ 2)  ## residual sum of squares
+    tss = sum((true - mean(true)) ^ 2)  ## total sum of squares
+    residuals = as.vector(true-prediction) # calculate residuals
+    diagnostics[a,'R_Squared'] = 1 - rss/tss # r_squared
+    diagnostics[a,'Adjusted_R_Squared'] = 1 - (rss/tss) * ((n - 1)/(n-p-1)) # adjusted r_squared
+    diagnostics[a,'RMSE'] = RMSE(y_pred=prediction, y_true=true) # rmse
+    diagnostics[a,'MAPE'] = MAPE(y_pred=prediction, y_true=true) # mape
+    diagnostics[a,'F_Stat'] = ((tss-rss)/p ) / (rss/(n-p-1)) # F-stat
+    diagnostics[a,'Durbin_Watson_Stat'] = durbinWatsonTest(residuals)} #DW-stat
+diagnostics
+```
+Also, we want to check the VIF & t-statistic for each variable for each product in each model.
+First, we need to write our own vif function becasue the vif library does not wotk weel with constrained regression models.
+```{r}
+# The vif function that we wrote
+vif_new <- function(mod) {
+    if (any(is.na(coef(mod)))) 
+        stop ("there are aliased coefficients in the model")
+    v <- vcov(mod)
+    assign <- 0:(length(coef(mod))-1)
+    if (names(coefficients(mod)[1]) == "param_X.Intercept.") {
+        v <- v[-1, -1]
+        assign <- assign[-1]
+    }
+    n.terms <- length(coef(mod)) - 1
+    R <- cov2cor(v)
+    detR <- det(R)
+    result <- matrix(0, n.terms, 3)
+    rownames(result) <- names(coef(mod))[-1]
+    colnames(result) <- c("GVIF", "Df", "GVIF^(1/(2*Df))")
+    for (term in 1:n.terms) {
+        subs <- which(assign == term)
+        result[term, 1] <- det(as.matrix(R[subs, subs])) *
+            det(as.matrix(R[-subs, -subs])) / detR
+        result[term, 2] <- length(subs)
+    }
+    if (all(result[, 2] == 1)) result <- result[, 1]
+    else result[, 3] <- result[, 1]^(1/(2 * result[, 2]))
+    result
+}
+```
+
+Then, we just computed vif and t-statistic for all six models.
+```{r}
+prod1_variable<-as.data.frame(vif_new(prod1_mul))
+colnames(prod1_variable)[1]<-"VIF_multiplicative"
+prod1_variable['VIF_logit']<-vif_new(prod1_logit)
+prod1_variable['Pr(>|t|)_multiplicative']<- summary(prod1_mul)$coefficient[2:12,4]
+prod1_variable['Pr(>|t|)_logit']<- summary(prod1_logit)$coefficient[2:12,4]
+rownames(prod1_variable) <- c("Price","Discount","Flyer","Email",
+                              "Web_Display","Paid_Search","TV","Radio",                   
+                              "Seasonality","Holiday", "Big_holiday")
+prod1_variable
+
+prod2_variable<-as.data.frame(vif_new(prod2_mul))
+colnames(prod2_variable)[1]<-"VIF_multiplicative"
+prod2_variable['VIF_logit']<-vif_new(prod2_logit)
+prod2_variable['Pr(>|t|)_multiplicative']<- summary(prod2_mul)$coefficient[2:13,4]
+prod2_variable['Pr(>|t|)_logit']<- summary(prod2_logit)$coefficient[2:13,4]
+rownames(prod2_variable) <- c("Price","Discount","Flyer","Email",
+                              "Web_Display","Store_Display", "Paid_Search","TV","Radio",                   
+                              "Seasonality","Holiday", "Big_holiday")
+prod2_variable
+
+prod3_variable<-as.data.frame(vif_new(prod3_mul))
+colnames(prod3_variable)[1]<-"VIF_multiplicative"
+prod3_variable['VIF_logit']<-vif_new(prod3_logit)
+prod3_variable['Pr(>|t|)_multiplicative']<- summary(prod3_mul)$coefficient[2:13,4]
+prod3_variable['Pr(>|t|)_logit']<- summary(prod3_logit)$coefficient[2:13,4]
+rownames(prod3_variable) <- c("Price","Discount","Flyer","Email",
+                              "Web_Display","Store_Display", "Paid_Search","TV","Radio",                   
+                              "Seasonality","Holiday", "Big_holiday")
+prod3_variable
+```
+
+
+## 5. Decompostition
+After evaluating the models, we have decided to use logit model for all products, to keep it consistent.
+In the following code, we calculate the duetos to base, price, promotion(discount) and various media promotion (flyer, email, store display, web display, tv and radio).
+
+### Product 1 : 138936951 decomposition
+```{r}
+model_1$pred <- predict(prod1_logit, newdata = model_1)
+model_1[, pred := max_sales_qty * exp(pred) / (exp(pred) + 1)]
+
+# Base: base price + seasonailty + holiday
+prediction_base <- copy(model_1)
+prediction_base[, weekly_price := base_price]
+
+prediction_base[, c('weekly_discount', 'Email', 'Flyer', 'Paid_Search', 'Web_Display', 'Store_Display', 'TV', 'Radio')] <- 0
+model_1$base <- predict(prod1_logit, newdata = prediction_base)
+model_1[, base := max_sales_qty * exp(base) / (exp(base) + 1)]
+
+# Due To Price
+prediction_price <- copy(model_1)
+prediction_price[, weekly_price := base_price] # replace weekly price with base price, with other attributes fixed
+model_1$due_to_base_price <- predict(prod1_logit, newdata = prediction_price)
+model_1[, due_to_base_price := max_sales_qty * exp(due_to_base_price) / (exp(due_to_base_price) + 1)]
+model_1[, due_to_Price := pred - due_to_base_price]
+model_1[, due_to_base_price := NULL]
+
+# Due To Promotion
+prediction_promo <- copy(model_1)
+prediction_promo[, weekly_discount := 0] # make promo = 0
+model_1$due_to_Promo <- predict(prod1_logit, newdata = prediction_promo)
+model_1[, due_to_Promo := max_sales_qty * exp(due_to_Promo) / (exp(due_to_Promo) + 1)]
+model_1[, due_to_Promo := pred - due_to_Promo]
+
+# Due TO Media, Flyer + Email + Web_Display + Store_Display + Paid_Search + TV + Radio
+for (media in c('Flyer', 'Email', 'Web_Display', 'Store_Display', 'Paid_Search', 'TV', 'Radio')) {
+    prediction_media <- copy(model_1)
+    prediction_media[, c(media) := 0] # make promo = 0
+    col_name = paste('due_to', media, sep = '_')
+    model_1[, c(col_name) := predict(prod1_logit, newdata = prediction_media)]
+    model_1[, c(col_name)] <- model_1$max_sales_qty * exp(model_1[, .SD, .SDcols = c(col_name)]) / (exp(model_1[, .SD, .SDcols = c(col_name)]) + 1)
+    model_1[, c(col_name)] <- model_1$pred - model_1[, .SD, .SDcols = c(col_name)]
+}
+
+# Rescale
+for (col in c('base', 'due_to_Price', 'due_to_Promo', 'due_to_Flyer', 'due_to_Email', 'due_to_Web_Display', 'due_to_Paid_Search', 'due_to_TV', 'due_to_Radio')) {
+    model_1[, c(col)] <- model_1[, .SD, .SDcols = c(col)] / model_1$pred * model_1$sales_amount
+}
+
+for (col in c('max_sales_qty', 'sales_log','sales_transformed', 'pred')) {
+    model_1[, c(col)] <- NULL
+}
+
+write.csv(model_1, '138936951.csv', row.names = FALSE)
+```
+
+### Product 2 : 138936952 decomposition
+```{r}
+model_2$pred <- predict(prod2_logit, newdata = model_2)
+model_2[, pred := max_sales_qty * exp(pred) / (exp(pred) + 1)]
+
+# Base: base price + seasonailty + holiday
+prediction_base <- copy(model_2)
+prediction_base[, weekly_price := base_price]
+
+prediction_base[, c('weekly_discount', 'Email', 'Flyer', 'Paid_Search', 'Web_Display', 'Store_Display', 'TV', 'Radio')] <- 0
+model_2$base <- predict(prod2_logit, newdata = prediction_base)
+model_2[, base := max_sales_qty * exp(base) / (exp(base) + 1)]
+
+# Due To Price
+prediction_price <- copy(model_2)
+prediction_price[, weekly_price := base_price] # replace weekly price with base price, with other attributes fixed
+model_2$due_to_base_price <- predict(prod2_logit, newdata = prediction_price)
+model_2[, due_to_base_price := max_sales_qty * exp(due_to_base_price) / (exp(due_to_base_price) + 1)]
+model_2[, due_to_Price := pred - due_to_base_price]
+model_2[, due_to_base_price := NULL]
+
+# Due To Promotion
+prediction_promo <- copy(model_2)
+prediction_promo[, weekly_discount := 0] # make promo = 0
+model_2$due_to_Promo <- predict(prod2_logit, newdata = prediction_promo)
+model_2[, due_to_Promo := max_sales_qty * exp(due_to_Promo) / (exp(due_to_Promo) + 1)]
+model_2[, due_to_Promo := pred - due_to_Promo]
+
+# Due TO Media, Flyer + Email + Web_Display + Store_Display + Paid_Search + TV + Radio
+for (media in c('Flyer', 'Email', 'Web_Display', 'Store_Display', 'Paid_Search', 'TV', 'Radio')) {
+    prediction_media <- copy(model_2)
+    prediction_media[, c(media) := 0] # make promo = 0
+    col_name = paste('due_to', media, sep = '_')
+    model_2[, c(col_name) := predict(prod2_logit, newdata = prediction_media)]
+    model_2[, c(col_name)] <- model_2$max_sales_qty * exp(model_2[, .SD, .SDcols = c(col_name)]) / (exp(model_2[, .SD, .SDcols = c(col_name)]) + 1)
+    model_2[, c(col_name)] <- model_2$pred - model_2[, .SD, .SDcols = c(col_name)]
+}
+
+# Rescale
+for (col in c('base', 'due_to_Price', 'due_to_Promo', 'due_to_Flyer', 'due_to_Email', 'due_to_Web_Display', 'due_to_Paid_Search', 'due_to_TV', 'due_to_Radio')) {
+    model_2[, c(col)] <- model_2[, .SD, .SDcols = c(col)] / model_2$pred * model_2$sales_amount
+}
+
+for (col in c('max_sales_qty', 'sales_log','sales_transformed', 'pred')) {
+    model_2[, c(col)] <- NULL
+}
+
+
+write.csv(model_2, '138936952.csv', row.names = FALSE)
+```
+
+### Product 3 : 138936953 decomposition
+```{r}
+model_3$pred <- predict(prod3_logit, newdata = model_3)
+model_3[, pred := max_sales_qty * exp(pred) / (exp(pred) + 1)]
+
+# Base: base price + seasonailty + holiday
+prediction_base <- copy(model_3)
+prediction_base[, weekly_price := base_price]
+
+prediction_base[, c('weekly_discount', 'Email', 'Flyer', 'Paid_Search', 'Web_Display', 'Store_Display', 'TV', 'Radio')] <- 0
+model_3$base <- predict(prod3_logit, newdata = prediction_base)
+model_3[, base := max_sales_qty * exp(base) / (exp(base) + 1)]
+
+# Due To Price
+prediction_price <- copy(model_3)
+prediction_price[, weekly_price := base_price] # replace weekly price with base price, with other attributes fixed
+model_3$due_to_base_price <- predict(prod3_logit, newdata = prediction_price)
+model_3[, due_to_base_price := max_sales_qty * exp(due_to_base_price) / (exp(due_to_base_price) + 1)]
+model_3[, due_to_Price := pred - due_to_base_price]
+model_3[, due_to_base_price := NULL]
+
+# Due To Promotion
+prediction_promo <- copy(model_3)
+prediction_promo[, weekly_discount := 0] # make promo = 0
+model_3$due_to_Promo <- predict(prod3_logit, newdata = prediction_promo)
+model_3[, due_to_Promo := max_sales_qty * exp(due_to_Promo) / (exp(due_to_Promo) + 1)]
+model_3[, due_to_Promo := pred - due_to_Promo]
+
+# Due TO Media, Flyer + Email + Web_Display + Store_Display + Paid_Search + TV + Radio
+for (media in c('Flyer', 'Email', 'Web_Display', 'Store_Display', 'Paid_Search', 'TV', 'Radio')) {
+    prediction_media <- copy(model_3)
+    prediction_media[, c(media) := 0] # make promo = 0
+    col_name = paste('due_to', media, sep = '_')
+    model_3[, c(col_name) := predict(prod3_logit, newdata = prediction_media)]
+    model_3[, c(col_name)] <- model_3$max_sales_qty * exp(model_3[, .SD, .SDcols = c(col_name)]) / (exp(model_3[, .SD, .SDcols = c(col_name)]) + 1)
+    model_3[, c(col_name)] <- model_3$pred - model_3[, .SD, .SDcols = c(col_name)]
+}
+
+# Rescale
+
+for (col in c('base', 'due_to_Price', 'due_to_Promo', 'due_to_Flyer', 'due_to_Email', 'due_to_Web_Display', 'due_to_Paid_Search', 'due_to_TV', 'due_to_Radio')) {
+    model_3[, c(col)] <- model_3[, .SD, .SDcols = c(col)] / model_3$pred * model_3$sales_amount
+}
+
+for (col in c('max_sales_qty', 'sales_log','sales_transformed', 'pred')) {
+    model_3[, c(col)] <- NULL
+}
+
+write.csv(model_3, '138936953.csv', row.names = FALSE)
+```
