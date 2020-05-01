@@ -1,0 +1,580 @@
+---
+title: "R Notebook"
+author: "Carl Xi"
+date: "12/16/2019"
+output:
+  html_document:
+    df_print: paged
+---
+```{r, message=FALSE, warning=FALSE}
+#Initial Imports
+library(igraph)
+library(Matrix)
+library(gdata)
+library(proxy)
+library(plm)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(zoo)
+library(stringr)
+library(RSiena)
+library(sna)
+library(geosphere)
+library(nnet)
+
+#let's set the working directory
+setwd("C:/Users/carlj/OneDrive/Documents/School-MSBA/Classes/Fall/Social Network Analytics/Assignment 6")
+
+#Data Import
+ExecRaw <- fread("execs.csv", header = TRUE)
+IndInvestorRaw <- fread("individual_investors.csv", header = TRUE)
+DealRaw <- fread("deal_details.csv", header = TRUE)
+InvestorRaw <- fread("investor_details.csv", header = TRUE)
+CompanyRaw <- fread("company_details.csv", header = TRUE)
+PeopleRaw <- fread("people.csv", header = TRUE)
+
+#focus the set of entrepreneurs just on those whose Full Title is indicated to be “Founder”, “Chief Executive Officer”, or “Managing Director”
+ExecRaw <- ExecRaw[grepl("Chief Executive Officer", Full.Title) | grepl("Founder", Full.Title) | grepl("Managing Director", Full.Title)]
+
+#removing all NAs
+DealRaw <- DealRaw[which(DealRaw$Deal_Date!=""),]
+
+#we tranfrom the date data into year
+DealRaw$Year <- as.integer(str_sub(DealRaw$Deal_Date,-2))
+
+#We make a function that only considers data from 2000 onwards
+changeY <- function(x){
+  if(x<=18){
+    x = x+2000
+  }
+  else{
+    x = x+1900
+  }
+  return(x)
+}
+
+#We apply the date transformation funciton
+DealRaw$Year <- sapply(DealRaw$Year,changeY)
+DealRaw <- DealRaw[which(DealRaw$Year>=2000),]
+
+#We consider investments for our purposes to be all the deals in the “Venture Capital” Deal Type
+DealRaw <- DealRaw[which(DealRaw$Deal_Class=="Venture Capital"),]
+
+#Let's now make the investor to exec EdgeList
+ExecRaw[, exec_no := seq_len(.N), by = CompanyId]
+
+#To account for firms where multiple execs have the founder/CEO role, we split this dataset into a list in order to create an unique RHS key when we eventually have to merge this to the investors dataset
+SplitExecs <- split(ExecRaw, f = ExecRaw$exec_no)
+
+#We can now set the key
+for(i in seq_along(SplitExecs)){
+  setkey(SplitExecs[[i]], CompanyId)
+}
+setkey(IndInvestorRaw, CompanyId)
+
+#And merge the two together
+EdgeList <- list()
+for(i in seq_along(SplitExecs)){
+EdgeList[[i]] <- merge(IndInvestorRaw, SplitExecs[[i]])
+print(paste0("executive no. ", i))
+flush.console()
+}
+
+#This will be the EdgeList object with ties and dates of ties
+EdgeList <- rbindlist(EdgeList)
+
+#Let's make sure the names are proper
+colnames(EdgeList)[colnames(EdgeList) == "PersonId.x"] = "investor"
+colnames(EdgeList)[colnames(EdgeList) == "PersonId.y"] = "exec"
+EdgeList[, Last.Updated := NULL]
+
+setorderv(EdgeList, c("investor", "exec", "DealId", "CompanyId", "exec_no", "InvestorId", "Role"))
+
+
+#Inclduing the deal information will help us make sure that we only consider the ties of each person while they are still at the company
+setkey(DealRaw, DealId)
+setkey(EdgeList, DealId)
+
+EdgeList <- merge(EdgeList, DealRaw[,-2])
+
+#We now subset the dates that correspond to when the deals happened
+EdgeList[, joined_date := as.Date(Date.Joined.Company, "%m/%d/%Y")]
+EdgeList[, left_date := as.Date(Date.Left.Company, "%m/%d/%Y")]
+EdgeList[, date := as.Date(Deal_Date, "%d %b %y")]
+
+EdgeList[!is.na(joined_date) & !is.na(date), exclude_date_joined := joined_date > date]
+EdgeList[!is.na(left_date) & !is.na(date), exclude_date_left := left_date < date]
+EdgeList[is.na(joined_date), exclude_date_joined := FALSE]
+EdgeList[is.na(left_date), exclude_date_left := FALSE]
+
+setorderv(EdgeList, c("exec", "date"))
+
+#We then have to bring in the company dataset in order to extract the founder and information on each company
+colnames(CompanyRaw)[1] <- "CompanyId" 
+setkey(CompanyRaw, CompanyId)
+setkey(EdgeList, CompanyId)
+
+#we can now make an edge list by merging the two datasets.
+EdgeList <- merge(EdgeList, CompanyRaw[, c("CompanyId", "Primary_Industry_Sector", "Primary_Industry_Group", "Primary_Industry_Code", "Business_Status", "City", "State")])
+
+#Just to be safe, let's make sure to only limit to VC deals
+unique(EdgeList$Deal_Class)
+
+setorderv(EdgeList, c("investor", "exec", "date"))
+
+#Lastly, we need to extract the personal information from the people dataset
+people <- PeopleRaw[,c("PersonId", "Gender", "Education")]
+colnames(people)[colnames(people) == "PersonId"] = "investor"
+setkey(people, investor)
+setkey(EdgeList, investor)
+
+#We again append the data to our existing edge list
+EdgeList <- merge(EdgeList, people)
+
+colnames(people)[colnames(people) == "investor"] = "exec"
+setkey(people, exec)
+setkey(EdgeList, exec)
+
+colnames(EdgeList)[colnames(EdgeList) == "Last Updated"] = "Last_Update_1"
+colnames(EdgeList)[colnames(EdgeList) == "Last_Updated"] = "Last_Update_2"
+EdgeList[, Last_Updated_1 := NULL]
+EdgeList[, Last_Updated_2 := NULL]
+
+EdgeList = merge(EdgeList, people)
+
+
+#We can now finally set our network to bipartite by removing cases where a person appears as both an investor and an entrepeneur
+EdgeList = EdgeList[!exec %in% investor]
+EdgeList = EdgeList[!investor %in% exec]
+```
+
+```{r}
+#With everything ready, we can now choose the primary industry groups. We will only be using deals between 2010 and 2017 to keep things simple and quick
+unique(EdgeList$Primary_Industry_Group)
+IndusGroupEdgeList <- EdgeList%>% group_by(Primary_Industry_Group)%>% summarise(count=n())
+
+#Let's create edge lists for each of the 5 industry groups
+
+#Healthcare Technology Systems
+HTS <- EdgeList[Year > 2009 & Year <= 2017 & Primary_Industry_Group == "Healthcare Technology Systems"] 
+
+#Transportation
+Transportation <- EdgeList[which(EdgeList$Primary_Industry_Group=="Transportation"),]
+#Apparel and Accessories
+AA <- EdgeList[which(EdgeList$Primary_Industry_Group=="Apparel and Accessories"),]
+#Insurance
+Insur <- EdgeList[which(EdgeList$Primary_Industry_Group=="Insurance"),]
+#Restaurants, Hotels and Leisure
+RHL <- EdgeList[which(EdgeList$Primary_Industry_Group=="Restaurants, Hotels and Leisure"),]
+```
+
+```{r}
+#We can now construct the wave in preparation for Siena. Firstly, we will need to set up a an yearly network object using igraph by first taking the most recent network and then removing all ties from this network that occured after each year 
+
+#We will use the graph_from_data_frame function
+HTSGraph = graph_from_data_frame(HTS[, c("investor", "exec")], directed = TRUE)
+V(HTSGraph)$type = V(HTSGraph)$name %in% HTS$exec
+
+HTSEdgeGraph = data.table(ends(HTSGraph, seq_len(ecount(HTSGraph))))
+
+colnames(HTSEdgeGraph) = c("investor", "exec")
+setkeyv(HTSEdgeGraph, c("investor", "exec"))
+ 
+HTSEdgeGraph[, edge_position := .I]
+
+HTS[, earliest_year := min(Year, na.rm = TRUE), by = c("investor", "exec")]
+HTS[, latest_year := max(Year, na.rm = TRUE), by = c("investor", "exec")]
+ 
+InitialYears = unique(HTS[,c("investor", "exec", "earliest_year", "latest_year")])
+setkeyv(InitialYears, c("investor", "exec"))
+ 
+InitialYearsEdges = merge(HTSEdgeGraph, InitialYears, all.x = TRUE)
+```
+
+```{r}
+#We can not set up networks for each year by removing all edge lists that occurs after each run of the function (basically year 'i'), as well as any not refreshed across YearData. We will have to generalize to those that are over 5 years old
+YearData = seq(min(as.numeric(HTS$Year), na.rm = TRUE), max(as.numeric(HTS$Year), na.rm = TRUE))
+
+InvestmentYear = lapply(seq_along(YearData), function(i) igraph::delete.edges(HTSGraph, InitialYearsEdges$edge_position[InitialYearsEdges$earliest_year > YearData[i] | YearData[i] - InitialYearsEdges$latest_year > 5]))
+ 
+#For each of the elements in InvestmentYear, we use get.incidence() from igraph to create the matrix for each year
+#We will be using the get.incidence function here
+InvestmentData = list(
+  get.incidence(InvestmentYear[[1]], sparse = FALSE),
+  get.incidence(InvestmentYear[[2]], sparse = FALSE),
+  get.incidence(InvestmentYear[[3]], sparse = FALSE),
+  get.incidence(InvestmentYear[[4]], sparse = FALSE),
+  get.incidence(InvestmentYear[[5]], sparse = FALSE),
+  get.incidence(InvestmentYear[[6]], sparse = FALSE),
+  get.incidence(InvestmentYear[[7]], sparse = FALSE),
+  get.incidence(InvestmentYear[[8]], sparse = FALSE)
+)
+ 
+#We can then setup the Siena data as an array by using the annual matrixes
+#We will first have to change all values greater than 1 to 1 since our matrix is unweighted
+for(i in 1:length(YearData)){
+  IndusGroupEdgeList<-InvestmentData[[i]]
+  IndusGroupEdgeList[IndusGroupEdgeList >1] <- 1
+  InvestmentData[[i]]<-IndusGroupEdgeList
+}
+
+HTSInvestments = sienaDependent(array(c(InvestmentData[[1]], InvestmentData[[2]],  InvestmentData[[3]],  InvestmentData[[4]],  InvestmentData[[5]],  InvestmentData[[6]],  InvestmentData[[7]], InvestmentData[[8]]), c(dim(InvestmentData[[1]]), length(YearData))),  "bipartite", nodeSet = c("Senders", "Receivers"))
+ 
+#We also have to make sure we set up the node sets using the sienaNodeSet function
+Senders <- sienaNodeSet(length(unique(HTS$investor)), nodeSetName = "Senders")
+Receivers <- sienaNodeSet(length(unique(HTS$exec)), nodeSetName = "Receivers")
+```
+
+
+```{r}
+#We make sure to include gyadic predictors based on individual attributes
+#As these objects must be designated as constants, we have to make sure that time-invariant dyadic covariates to the nodeSets “Senders” and “Receivers” using coDyadCovar()
+
+#Let's take a look at ethnics homophily
+Ethics <- unique(fread("representative_names.csv", header = TRUE)[,c("Name","race")])
+IndusGroupEdgeList <- merge(unique(HTS[,"investor"]),PeopleRaw[,c("PersonId","Last Name")],by.x="investor",by.y="PersonId")
+IndusGroupEdgeList$`Last Name` <- toupper(IndusGroupEdgeList$`Last Name`) 
+IndusGroupEdgeList <- merge(IndusGroupEdgeList,Ethics,by.x="Last Name",by.y="Name",all.x = TRUE)
+IndusGroupEdgeList[which(IndusGroupEdgeList$race=="white"),"race"]<-NA
+
+HTSPeople <- merge(unique(HTS[,"exec"]),PeopleRaw[,c("PersonId","Last Name")],by.x="exec",by.y="PersonId")
+HTSPeople$`Last Name` <- toupper(HTSPeople$`Last Name`) 
+HTSPeople <- merge(HTSPeople,Ethics,by.x="Last Name",by.y="Name",all.x = TRUE)
+HTSPeople[which(HTSPeople$race=="white"),"race"]<-NA
+
+#Let's convert this to a named vector
+IndusGroupEdgeList <- setNames(IndusGroupEdgeList$race,IndusGroupEdgeList$investor)
+HTSPeople <- setNames(HTSPeople$race,HTSPeople$exec)
+
+IndusGroupEdgeList <- as.vector(IndusGroupEdgeList)
+HTSPeople <- as.vector(HTSPeople)
+
+#Taking a look at cov
+CovMatrix <- outer(IndusGroupEdgeList,HTSPeople,"==")
+CovMatrix[is.na(CovMatrix)] <- 0
+
+#Let's create the Ethics output matrix
+EthicsMatrix <- coDyadCovar(CovMatrix,nodeSets=c("Senders","Receivers"),type="bipartite")
+
+#Finally, let's make sure that the columns and rows are consistent
+dim(EthicsMatrix)
+dim(InvestmentData[[1]])
+
+#Now let's take a look at gender homophily
+IndusGroupEdgeList <- unique(HTS[,c("investor","Gender.x")])
+HTSPeople <- unique(HTS[,c("exec","Gender.y")])
+
+#Again, we have to conver this to a named vector
+IndusGroupEdgeList <- as.vector(setNames(IndusGroupEdgeList$Gender.x,IndusGroupEdgeList$investor))
+HTSPeople <- as.vector(setNames(HTSPeople$Gender.y,HTSPeople$exec))
+
+#Again, let's take a look at cov
+CovMatrix <- outer(IndusGroupEdgeList,HTSPeople,"==")
+CovMatrix[is.na(CovMatrix)] <- 0
+
+#Let's create the Gender output matrix
+GenderMatrix <- coDyadCovar(CovMatrix,nodeSets=c("Senders","Receivers"),type="bipartite")
+
+#Finally, let's make sure that the columns and rows are consistent
+dim(GenderMatrix)
+
+#Next up is top school homophily
+#Let's first look at all the schools in our dataset
+g1 <- HTS[,"Education.x"]
+colnames(g1) <- "school"
+g2 <- HTS[,"Education.y"]
+colnames(g2) <- "school"
+t3 <- rbind(g1,g2)%>%
+  group_by(school)%>%
+  summarise(count=n())
+
+IndusGroupEdgeList <- unique(HTS[,c("investor","Education.x")])
+HTSPeople <- unique(HTS[,c("exec","Education.y")])
+
+#Here is a list of the top schools
+TopSchools <- c("Brown University","Columbia University","Cornell University","Dartmouth College","Harvard","Princeton University","University of Pennsylvania","Yale University","MIT","Stanford","Northwestern University","Massachusetts Institute of Technology","Berkeley","Columbia Business School","University of Chicago","Carnegie Mellon University","Oxford","Cambridge")
+
+#Let's check if each person has educational background from one of the top schools above
+IndusGroupEdgeList$TopSchools <- grepl(paste(TopSchools,collapse="|"), IndusGroupEdgeList$Education.x)
+HTSPeople$TopSchools <- grepl(paste(TopSchools,collapse="|"), HTSPeople$Education.y)
+
+#Again, let's convert this into a named vector
+IndusGroupEdgeList <- as.vector(setNames(IndusGroupEdgeList$TopSchools,IndusGroupEdgeList$investor))
+HTSPeople <- as.vector(setNames(HTSPeople$TopSchools,HTSPeople$exec))
+
+IndusGroupEdgeList[IndusGroupEdgeList==FALSE]<-NA
+HTSPeople[HTSPeople==FALSE]<-NA
+
+#Moving on, let's take a look at cov
+CovMatrix <- outer(IndusGroupEdgeList,HTSPeople,"==")
+CovMatrix[is.na(CovMatrix)] <- 0
+
+#Once again, we construct the output matrix for education
+EduMatrix <- coDyadCovar(CovMatrix,nodeSets=c("Senders","Receivers"),type="bipartite")
+
+#Let's make sure that the columns and rows are consistent
+dim(EduMatrix)
+
+
+#Next up is geographic homophily
+load("C:/Users/carlj/OneDrive/Documents/School-MSBA/Classes/Fall/Social Network Analytics/Assignment 6/edges_dist.RData")
+IndusGroupEdgeList <- unique(HTS[,c("investor","InvestorId")])
+HTSPeople <- unique(HTS[,c("exec","CompanyId")])
+
+#We first need to merge this with location information
+IndusGroupEdgeList <- merge(IndusGroupEdgeList,unique(edges_dist[,c(1,6,5)]),by="InvestorId",all.x=TRUE)
+HTSPeople <- merge(HTSPeople,unique(edges_dist[,c(2,4,3)]),by="CompanyId",all.x=TRUE)
+
+#We make sure to only keep first observation for each individual
+IndusGroupEdgeList[, no := seq_len(.N), by = investor]
+IndusGroupEdgeList <- IndusGroupEdgeList[which(no==1),]
+
+HTSPeople[, no := seq_len(.N), by = exec]
+HTSPeople <- HTSPeople[which(no==1),]
+
+#Let's set the input for our matrix
+IndusGroupEdgeList <- data.frame(unique(IndusGroupEdgeList[,c(2:4)]), row.names = 1)
+HTSPeople <- data.frame(unique(HTSPeople[,c(2:4)]), row.names = 1)
+
+CovMatrix <- distm(as.matrix(IndusGroupEdgeList),as.matrix(HTSPeople),fun=distGeo)
+dim(CovMatrix)
+rownames(CovMatrix) <- rownames(IndusGroupEdgeList)
+colnames(CovMatrix) <- rownames(HTSPeople)
+
+CovMatrix[CovMatrix=="NaN"] <- NA
+
+#Let's finally create the Geography Matrix
+GeoMatrix <- coDyadCovar(CovMatrix,nodeSets=c("Senders","Receivers"),type="bipartite")
+
+
+#Just 2 more left, gotta hang in there. Now we look at experience homophily
+
+#The covariate can be computed as an outer product of the difference between the first year of investment or year of venture founding for each person
+IndusGroupEdgeList <- unique(HTS[,c("investor","Year")])
+HTSPeople <- unique(HTS[,c("exec","Year")])
+
+IndusGroupEdgeList <- IndusGroupEdgeList%>% group_by(investor)%>% summarise(first=min(Year))
+
+HTSPeople <- HTSPeople%>% group_by(exec)%>% summarise(first=min(Year))
+
+#We have to convert this into a named vector
+IndusGroupEdgeList <- as.vector(setNames(IndusGroupEdgeList$first,IndusGroupEdgeList$investor))
+HTSPeople <- as.vector(setNames(HTSPeople$first,HTSPeople$exec))
+
+#Let's take a look at the difference
+CovMatrix <- outer(IndusGroupEdgeList,HTSPeople,"-")
+CovMatrix <- abs(CovMatrix)
+
+#We can transform this into an similarity matrix by subtracting each person's individual idfference from the maximum difference
+MatrixMax <- max(CovMatrix)
+CovMatrix <- 7-CovMatrix
+rownames(CovMatrix) <- rownames(IndusGroupEdgeList)
+colnames(CovMatrix) <- rownames(HTSPeople)
+
+#Just like what we've done a billion times above, we output the results in a matrix
+ExperienceMatrix <- coDyadCovar(CovMatrix,nodeSets=c("Senders","Receivers"),type="bipartite")
+
+
+#Last but certainly not least is looking at complementary homophily
+IndusGroupEdgeList <- unique(HTS[,c("investor","Education.x")])
+HTSPeople <- unique(HTS[,c("exec","Education.y")])
+
+#Again, here is the list of top schools
+TopSchools <- c("Brown University","Columbia University","Cornell University","Dartmouth College","Harvard","Princeton University","University of Pennsylvania","Yale University","MIT","Stanford","Northwestern University","Massachusetts Institute of Technology","Berkeley","Columbia Business School","University of Chicago","Carnegie Mellon University","Oxford","Cambridge")
+
+#We check if each person has education from the top schools
+IndusGroupEdgeList$tech <- grepl("engineering|ph.D", IndusGroupEdgeList$Education.x)
+IndusGroupEdgeList$bus <- grepl("MBA", IndusGroupEdgeList$Education.x)
+HTSPeople$tech <- grepl("engineering|ph.D", HTSPeople$Education.y)
+HTSPeople$bus <- grepl("MBA", HTSPeople$Education.y)
+
+#We combine the investor-tech columns and convert them into a named vector
+InvestorTechVector <- as.vector(setNames(IndusGroupEdgeList$tech,IndusGroupEdgeList$investor))
+
+#We do the same for exec-bus columns 
+BusinessExecVector <- as.vector(setNames(HTSPeople$bus,HTSPeople$exec))
+
+#Let's look at the cov
+CovMatrix1 <- outer(InvestorTechVector,BusinessExecVector,"&")
+
+#We combine the investor-bus columns and convert them into a named vector
+InvestorBusinessVector <- as.vector(setNames(IndusGroupEdgeList$bus,IndusGroupEdgeList$investor))
+
+#We combine the exec-tech columns and convert them into a named vector
+ExecTechVector <- as.vector(setNames(HTSPeople$tech,HTSPeople$exec))
+
+#Let's look at the second cov
+CovMatrix3 <- outer(InvestorBusinessVector,ExecTechVector,"&")
+
+#With both created, we can join them together
+CovMatrix <- CovMatrix1+CovMatrix3
+rownames(CovMatrix) <- rownames(IndusGroupEdgeList)
+colnames(CovMatrix) <- rownames(HTSPeople)
+
+#This is our final output matrix
+SkillsMatrix <- coDyadCovar(CovMatrix,nodeSets=c("Senders","Receivers"),type="bipartite")
+```
+
+
+```{r}
+#We can now look at individual predictors
+
+#These objects must be designated as constant, time-invariant alter covariates to the nodeSets “Receivers” using coDyadCovar(). These covariates should be input in the form of a vector where the entries match the ordering of the entrepreneurs in the adjacencymatrix. These covariates will havean “altX” for interaction in includeEffects() 
+
+#Entrepreneur Ethics minority,a constant alter covariate that indicates whether the entrepreneur's race is not Caucasian 
+IndusGroupEdgeList <- merge(unique(HTS[,"exec"]),PeopleRaw[,c("PersonId","Last Name")],by.x="exec",by.y="PersonId")
+IndusGroupEdgeList$`Last Name` <- toupper(IndusGroupEdgeList$`Last Name`) 
+IndusGroupEdgeList <- merge(IndusGroupEdgeList,Ethics,by.x="Last Name",by.y="Name",all.x = TRUE)
+IndusGroupEdgeList$minority <- IndusGroupEdgeList$race!="white"
+
+#Let's convert this into a named vector
+IndusGroupEdgeList <- as.vector(setNames(IndusGroupEdgeList$minority,IndusGroupEdgeList$exec))
+IndusGroupEdgeList[IndusGroupEdgeList==FALSE|is.na(IndusGroupEdgeList)] <-0
+
+#We can create the output matrix using coDyadCovar, but we ran into several errors so we decided to use coCovar instead
+#nonwhite_exec <- coDyadCovar(IndusGroupEdgeList,nodeSets=c("Receivers")) <- this is how the code should look like if it works
+nonwhite_exec <- coCovar(IndusGroupEdgeList,nodeSet="Receivers")
+
+#We now move onto looking at the entrepreneurs' gender by looking atthe constant alter covariates that indicate each entrepreneur’s gender. This can be computed as a binary vector
+IndusGroupEdgeList <- unique(HTS[,c("exec","Gender.y")])
+
+#Let's convert this into a named vector
+IndusGroupEdgeList <- as.vector(setNames(IndusGroupEdgeList$Gender.y,IndusGroupEdgeList$exec))
+IndusGroupEdgeList[IndusGroupEdgeList=="Male"]<-0
+IndusGroupEdgeList[IndusGroupEdgeList=="Female"]<-1
+IndusGroupEdgeList <- as.numeric(IndusGroupEdgeList)
+
+ExecutiveGender <- coCovar(IndusGroupEdgeList,nodeSet="Receivers")
+
+
+#Just like above, we can create a binary vector for whether each entrepreneur earned a degree from a top school by creating a constant alter covariate that indicates such.
+HTSPeople <- unique(HTS[,c("exec","Education.y")])
+HTSPeople$TopSchools <- grepl(paste(TopSchools,collapse="|"), HTSPeople$Education.y)
+
+#Again, we convert this into a named vector
+HTSPeople <- as.vector(setNames(HTSPeople$TopSchools,HTSPeople$exec))
+HTSPeople[HTSPeople==FALSE]<-0
+
+IvyExecs <- coCovar(HTSPeople,nodeSet="Receivers")
+
+#Unfortunately, I ran out of time to work the rest, but essentially we repeat this process above for the remaining factors. I have listed all the remaining factors below.
+
+#Entrepreneur geographic hub,a constant alter covariate indicating that the entrepreneur’s startup is located in one of the 10 cities that are most common for startups that are invested in to be located in. If individuals have multiple locations, you can use the ﬁrst location ascribed to them in the data.
+
+#Entrepreneur experience,a constant alter covariate indicating the year an entrepreneur’s ﬁrst venture received funding. This can be computed as a numeric vector. 
+
+#Entrepreneur business skills,a constant alter covariate indicating whether an entrepreneur received an MBA. 
+
+#Entrepreneurtechnicalskills,aconstantaltercovariateindicatingwhetheranentrepreneur received a technical degree like a PhD or an engineering degree. 
+
+#Entrepreneurventureround,aconstantaltercovariateindicatingwhatroundoffunding a venture is on, as the cumulative count of unique funding deals it has received from investors. 
+```
+
+```{r}
+#As I have indicated above, I ran out of time, but to look at the siena effects the below would be roughly what we would do
+#the personal characteristics of investors look like
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "nonwhite_exec")
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "ExecutiveGender")
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "IvyExecs")
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "tech_hub_exec")
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "first_year_exec")
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "mba_exec")
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "technical_exec")
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "prior_successes_exec")
+#SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "round_exec")
+```
+
+```{r}
+#Define the data set and obtain the basic effects object
+Data = sienaDataCreate(HTSInvestments,EthicsMatrix,nodeSets = list (Senders,Receivers))
+Effects = getEffects(Data)
+
+
+#include effects
+# now let's set up some effects
+
+# first the structural effects that are not yet included by default
+Effects = includeEffects(Effects,cycle4,outActSqrt,inPopSqrt,outInAss)
+Effects
+```
+
+
+```{r}
+#We now want to add dyadic predictors  for ethics, but again like above unfortunately I didn't really have a chance to due to running out of time
+#reference code myEffects <- includeEffects(myEffects, simX,interaction1="drinking", name="friends")
+#effectsDocumentation()
+Effects <- includeEffects(Effects,X,interaction1="EthicsMatrix")
+
+Effects = includeEffects(Effects,egoX,altX,simX,interaction1="EthicsMatrix")
+```
+
+
+
+
+```{r}
+#Extra Credit
+setwd("C:/Users/carlj/OneDrive/Documents/School-MSBA/Classes/Fall/Social Network Analytics/Assignment 6")
+
+
+#Data Import
+StartUpStates <- fread("startup_states.csv", header = TRUE)
+IndInvestorOutcomes <- fread("individual_investor_outcomes.csv", header = TRUE)
+```
+```{r}
+#a) first regression predicts whether investing based on homophily will help investors avoid going out of business
+summary(glm(out_of_business ~ l4c_scaled +  gender + ethnicity + age_diff + geo_dist + ivyplus + complementarity + male_exec + nonwhite_exec + ivyplus_exec + year + inv_long + inv_lat, data = IndInvestorOutcomes, family = "binomial"))
+```
+```{r}
+#Looking at the coefficients, we can see that l4c_scaled, gender, age_difference, ivyplus, nonwhite_exec, year and inv_lat are negatively correlated with out_of_business. On the other hand, ethnicity, geo_dist, complementarity, male_exec, ivyplus_exec and inv_long are positively correlated with out_of_business.
+
+#This tells us that higher homophily when it comes to the scaled number of 4-cycles, gender, age difference, having went to top schools and having more entreprenrur ethnic minorities help investors avoid going out of business.
+
+#On the other hand, higher homophily when it comes to ethnicity, geography distance, complementary skills, entrepreneur gender, entrepreneur top school background contribute to investors going out of business. 
+
+#In conclusion, investing based on homophily help investors avoid going out of business only for certain factors, so investors should choose carefully.
+```
+
+
+```{r}
+#b) second regression predicts whether investing based on homophily will help investors achieve more successful investments
+summary(glm(factor(successful_investments) ~ l4c_scaled +  gender + ethnicity + age_diff + geo_dist + ivyplus + complementarity + male_exec + nonwhite_exec + ivyplus_exec + year + inv_long + inv_lat, data = IndInvestorOutcomes, family = "binomial"))
+```
+```{r}
+#Looking at the coefficients, we can see that l4c_scaled, gender, age_difference, nonwhite_exec, and inv_lat are positively correlated with successful_investments. On the other hand, ethnicity, geo_dist, ivyplus, complementarity, male_exec, ivyplus_exec, year, and inv_long are negatively correlated with successful_investments.
+
+#This tells us that higher homophily when it comes to the scaled number of 4-cycles, gender, age difference, and having more entreprenrur ethnic minorities help investors achieve more successful investments.
+
+#On the other hand, higher homophily when it comes to ethnicity, geography distance, having went to top schools, complementary skills, entrepreneur gender, entrepreneur top school background help investors achieve less successful investments.
+
+#In conclusion, investing based on homophily help investors achieve more successful investments only for certain factors, so investors should choose carefully.
+```
+
+
+```{r}
+#c) last regression predicts whether startups benefit from investment based on homophily.
+ExtraC <- multinom(company_state ~ l4c_scaled +  gender + ethnicity + age_diff + geo_dist + ivyplus + complementarity + male_exec + nonwhite_exec + ivyplus_exec + year + comp_lon + comp_lat, data = StartUpStates, family = "binomial")
+
+z = summary(ExtraC)$coefficients/summary(ExtraC)$standard.errors
+
+print( (1 - pnorm(abs(z), 0, 1)) * 2)
+
+#The coefficients in this model represent the likelihood of a startup being in any one of the categories indicated, versus the “reference” category, which acts as the baseline. R interprets the reference category as the first factor level as the reference category. Use as the reference category the company state “startup”
+
+#This command does not estimate p-values for statistical significance on its own, so instead these can be estimated by computing the z-scores of the coefficients: 
+
+#z = summary(model)$coefficients/summary(model)$standard.errors 
+
+#and then conducting the significance test:
+
+#(1 - pnorm(abs(z), 0, 1)) * 2
+
+#If the value returned is below 0.05, then we can conclude that the predictor was significant.
+#Does investing based on homophily help entrepreneurs’ ventures achieve better outcomes such as Exit or Profitable? What does it seem to suggest about how failing fast through homophily influences the trajectory of a startup?
+```
+```{r}
+#Looking at the significance test of the z-scores of the coefficients, we can see that all coefficients are significant, with the only exception being geo_distance not being significant for predicting companies categorized as profitable. 
+
+#This means that investing based on homophily help entrepreneurs’ ventures achieve better outcomes such as Exit or Profitable. When it comes to startups, failing fast through homophily also influences the trajectory of startups across the board. 
+```
+
