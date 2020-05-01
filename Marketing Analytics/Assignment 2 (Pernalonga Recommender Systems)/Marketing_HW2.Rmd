@@ -1,0 +1,119 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(dplyr)
+library(data.table)
+library(psych)
+library(ggplot2)
+```
+
+```{r}
+setwd("c:/Users/Jie Z/Desktop")
+product <- fread('product_table.csv')
+transaction <- fread('transaction_table.csv')
+transaction <- transaction %>% filter (tran_prod_paid_amt >= 0)
+# check missing value
+str(transaction)
+sapply(transaction,function(x) sum(is.na(x)))
+sapply(product,function(x) sum(is.na(x)))
+# Joining tables and create new transaction id 
+transaction_product <- inner_join(transaction,product, by="prod_id")
+transaction_product$new_tran_id <- paste(as.character(transaction_product$tran_dt),as.character(transaction_product$store_id),as.character(transaction_product$cust_id),sep="")
+```
+
+```{r}
+chocolate <- as.data.table(transaction_product)
+remove(product,transaction)
+chocolate <- chocolate[category_desc_eng %like% "CHOCOLATE"]
+chocolate_all <- select(chocolate,cust_id,new_tran_id,tran_dt,brand_desc,store_id,prod_id,tran_prod_sale_qty,tran_prod_sale_amt,prod_unit_price,tran_prod_discount_amt,tran_prod_paid_amt,category_desc_eng)
+
+unique(chocolate_all$category_desc_eng)
+unique(chocolate_all[brand_desc == "NESTLE"]$category_desc_eng)
+```
+
+```{r}
+data <- chocolate_all %>%
+  group_by(cust_id) %>%
+  summarize(qty = sum(tran_prod_sale_qty),amt_paid = sum(tran_prod_paid_amt),avg_discount_rate = -sum(tran_prod_discount_amt)/sum(tran_prod_sale_amt),amt_nestle_rate = sum(tran_prod_paid_amt[brand_desc == "NESTLE"])/sum(tran_prod_paid_amt),amt_private_rate = sum(tran_prod_paid_amt[brand_desc == "PRIVATE LABEL"])/sum(tran_prod_paid_amt)) %>%
+  arrange(desc(amt_paid))
+
+```
+
+```{r}
+ggplot(data,aes(x=amt_nestle_rate)) + 
+  geom_histogram(binwidth=0.01) +
+  geom_vline(xintercept=summary(data$amt_nestle_rate)[2], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data$amt_nestle_rate)[3], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data$amt_nestle_rate)[5], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data$amt_nestle_rate)[6], color="grey",linetype="dashed",size=1) +
+  geom_text(aes(x=summary(data$amt_nestle_rate)[2], label="25th percentile", y=1200), colour="red", angle=90, vjust = 1.2) +
+  geom_text(aes(x=summary(data$amt_nestle_rate)[3], label="median", y=1200), colour="red", angle=90, vjust = 1.2) +
+  geom_text(aes(x=summary(data$amt_nestle_rate)[5], label="75th percentile", y=1200), colour="red", angle=90, vjust = 1.2) +
+  xlab('percentage of total chocolate purchase value spent on Nestle products')
+
+ggplot(data,aes(x=amt_paid)) + 
+  geom_histogram(binwidth=10) +
+  geom_vline(xintercept=summary(data$amt_paid)[1], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data$amt_paid)[2], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data$amt_paid)[3], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data$amt_paid)[5], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data$amt_paid)[6], color="grey",linetype="dashed",size=1) +
+  geom_text(aes(x=summary(data$amt_paid)[2], label="25th percentile", y=600), colour="red", angle=90, vjust = 1.2) +
+  geom_text(aes(x=summary(data$amt_paid)[3], label="median", y=600), colour="red", angle=90, vjust = 1.2) +
+  geom_text(aes(x=summary(data$amt_paid)[5], label="75th percentile", y=600), colour="red", angle=90, vjust = 1.2) +
+  xlab('total chocolate purchase value')
+```
+
+```{r}
+summary(data$amt_nestle_rate)
+summary(data$amt_paid)
+summary(data$amt_private_rate)
+
+data1 <- as.data.table(data)[amt_private_rate == 0]
+nestle_fans <- data1[amt_nestle_rate >= 0.25 & amt_paid <= 54]
+competitor_fans <- data1[amt_nestle_rate <= 0.06 & amt_paid > 54]
+```
+
+```{r}
+brands <- chocolate_all %>%
+  group_by(brand_desc) %>%
+  summarize(customer=n_distinct(cust_id), avg_discount_rate=-sum(tran_prod_discount_amt)/sum(tran_prod_sale_amt),amt_per_customer=sum(tran_prod_paid_amt)/customer) %>%
+  arrange(desc(amt_per_customer))
+```
+
+```{r}
+ggplot(data1,aes(x=amt_nestle_rate)) + 
+  geom_histogram(binwidth=0.01) +
+  geom_vline(xintercept=summary(data1$amt_nestle_rate)[2], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data1$amt_nestle_rate)[3], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data1$amt_nestle_rate)[5], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data1$amt_nestle_rate)[6], color="grey",linetype="dashed",size=1) +
+  geom_text(aes(x=summary(data1$amt_nestle_rate)[2], label="25th percentile", y=400), colour="red", angle=90, vjust = 1.2) +
+  geom_text(aes(x=summary(data1$amt_nestle_rate)[3], label="median", y=400), colour="red", angle=90, vjust = 1.2) +
+  geom_text(aes(x=summary(data1$amt_nestle_rate)[5], label="75th percentile", y=400), colour="red", angle=90, vjust = 1.2) +
+  xlab('percentage of total chocolate purchase value spent on Nestle products')
+
+ggplot(data1,aes(x=amt_paid)) + 
+  geom_histogram(binwidth=10) +
+  geom_vline(xintercept=summary(data1$amt_paid)[1], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data1$amt_paid)[2], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data1$amt_paid)[3], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data1$amt_paid)[5], color="grey",linetype="dashed",size=1) +
+  geom_vline(xintercept=summary(data1$amt_paid)[6], color="grey",linetype="dashed",size=1) +
+  geom_text(aes(x=summary(data1$amt_paid)[2], label="25th percentile", y=200), colour="red", angle=90, vjust = 1.2) +
+  geom_text(aes(x=summary(data1$amt_paid)[3], label="median", y=200), colour="red", angle=90, vjust = 1.2) +
+  geom_text(aes(x=summary(data1$amt_paid)[5], label="75th percentile", y=200), colour="red", angle=90, vjust = 1.2) +
+  xlab('total chocolate purchase value')
+```
+
+```{r}
+fwrite(arrange(brands,desc(avg_discount_rate)),'tableau.csv')
+```
+
+```{r}
+competitor_fans[amt_nestle_rate == 0]
+```
+
