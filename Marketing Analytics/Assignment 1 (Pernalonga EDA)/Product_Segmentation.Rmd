@@ -1,0 +1,196 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(dplyr)
+library(data.table)
+library(stats)
+library(purrr)
+library(cluster)
+library(factoextra)
+library(gtools)
+library(igraph)
+setwd("C:/Users/Frank/Desktop")
+product <- fread('product_table.csv')
+transaction <- fread('transaction_table.csv')
+```
+
+```{r}
+transaction <- transaction %>% filter (tran_prod_paid_amt >= 0)
+```
+
+
+```{r}
+# check missing value
+str(transaction)
+sapply(transaction,function(x) sum(is.na(x)))
+sapply(product,function(x) sum(is.na(x)))
+```
+
+```{r}
+# Joining tables and create new transaction id ---------------------------------------
+transaction_product <- inner_join(transaction,product, by="prod_id")
+transaction_product$new_tran_id <- paste(as.character(transaction_product$tran_dt),as.character(transaction_product$store_id),as.character(transaction_product$cust_id),sep="")
+```
+
+
+```{r}
+## products with the best volumes (count and KG are separated)
+prod_vol_count <- transaction %>% group_by(prod_id, prod_unit) %>% summarise(total_vol = sum(tran_prod_sale_qty)) %>% arrange(desc(total_vol)) %>% filter(prod_unit == "CT")
+print(prod_vol_count[1:10,])
+prod_vol_KG <- transaction %>% group_by(prod_id, prod_unit) %>% summarise(total_vol = sum(tran_prod_sale_qty)) %>% arrange(desc(total_vol)) %>% filter(prod_unit == "KG")
+print(prod_vol_KG[1:10,])
+
+
+## products with the best revenues
+prod_rev <- transaction %>% group_by(prod_id) %>% summarise(total_rev = sum(tran_prod_paid_amt)) %>% arrange(desc(total_rev))
+print(prod_rev[1:10,])
+
+## products with the most customers
+prod_cust <- transaction %>% group_by(prod_id) %>% summarise(total_cust = n_distinct(cust_id)) %>% arrange(desc(total_cust))
+print(prod_cust[1:10,])
+
+## products with the most stores
+prod_store <- transaction %>% group_by(prod_id) %>% summarise(total_store = n_distinct(store_id)) %>% arrange(desc(total_store))
+print(prod_store[1:10,])
+
+## products with the most transactions
+prod_trans <- transaction_product %>% group_by(prod_id) %>% summarise(total_trans = n_distinct(new_tran_id)) %>% arrange(desc(total_trans))
+print(prod_trans[1:10,])
+```
+```{r}
+plot(1:nrow(prod_rev)/nrow(prod_rev), cumsum(prod_rev$total_rev)/sum(prod_rev$total_rev),xlab="# of Products",main='Product and Revenue', ylab="Percentage of Total Revenue")
+```
+
+
+```{r}
+## categories with the best volumes (count and KG are separated)
+category_vol_count <- transaction_product %>% group_by(category_desc_eng, prod_unit) %>% summarise(total_vol = sum(tran_prod_sale_qty)) %>% arrange(desc(total_vol)) %>% filter(prod_unit == "CT")
+category_vol_KG <- transaction_product %>% group_by(category_desc_eng, prod_unit) %>% summarise(total_vol = sum(tran_prod_sale_qty)) %>% arrange(desc(total_vol)) %>% filter(prod_unit == "KG")
+print(category_vol_count[1:10,])
+print(category_vol_KG[1:10,])
+
+## categories with the best revenues
+category_rev <- transaction_product %>% group_by(category_desc_eng) %>% summarise(total_rev = sum(tran_prod_paid_amt)) %>% arrange(desc(total_rev))
+print(category_rev[1:36,])
+
+## categories with the best customers
+category_cust <- transaction_product %>% group_by(category_desc_eng) %>% summarise(total_cust = n_distinct(cust_id)) %>% arrange(desc(total_cust))
+print(category_cust[1:10,])
+```
+
+
+
+```{r}
+## products with the most transactions
+category_trans <- transaction_product %>% group_by(category_desc_eng) %>% summarise(total_trans = n_distinct(new_tran_id)) %>% arrange(desc(total_trans))
+print(category_trans[1:10,])
+```
+
+```{r}
+plot(1:nrow(category_rev)/nrow(category_rev), cumsum(category_rev$total_rev)/sum(category_rev$total_rev), main ='Category and Revenue',xlab="# of Categories", ylab="Percentage of Total Revenue")
+sum(category_rev[1:36,2])/sum(category_rev$total_rev)
+```
+
+
+```{r}
+## subcategories with the best volumes (count and KG are separated)
+subcategory_vol_count <- transaction_product %>% group_by(sub_category_desc, prod_unit) %>% summarise(total_vol = sum(tran_prod_sale_qty)) %>% arrange(desc(total_vol)) %>% filter(prod_unit == "CT")
+print(subcategory_vol_count[1:10,])
+subcategory_vol_KG <- transaction_product %>% group_by(sub_category_desc, prod_unit) %>% summarise(total_vol = sum(tran_prod_sale_qty)) %>% arrange(desc(total_vol)) %>% filter(prod_unit == "KG")
+print(subcategory_vol_KG[1:10,])
+
+## subcategories with the best revenues
+subcategory_rev <- transaction_product %>% group_by(sub_category_desc) %>% summarise(total_rev = sum(tran_prod_paid_amt)) %>% arrange(desc(total_rev))
+print(subcategory_rev[1:10,])
+
+## subcategories with the best customers
+subcategory_cust <- transaction_product %>% group_by(sub_category_desc) %>% summarise(total_cust = n_distinct(cust_id)) %>% arrange(desc(total_cust))
+print(subcategory_cust[1:10,])
+```
+
+
+```{r}
+plot(1:nrow(subcategory_rev)/nrow(subcategory_rev), cumsum(subcategory_rev$total_rev)/sum(subcategory_rev$total_rev), main="Product and Revenue", xlab="# of Subcategories", ylab="Percentage of Total Revenue")
+```
+
+
+```{r}
+## create key attributes for product clustering
+product_statistics <- transaction_product %>% group_by(prod_id) %>% summarise(total_revenue = sum(tran_prod_paid_amt), total_transact=n_distinct(new_tran_id), total_distinct_customer = n_distinct(cust_id), total_stores = n_distinct(store_id), avg_discount_rate = (abs(sum(tran_prod_discount_amt))/sum(tran_prod_sale_amt)))
+
+discounted_product_cnt <- transaction_product %>% filter(tran_prod_discount_amt < 0) %>% group_by(prod_id) %>% summarise(discounted_tran_cnt=n_distinct(tran_id))
+
+product_statistics <- inner_join(product_statistics, discounted_product_cnt, by="prod_id") %>% mutate(percentage_discount_product = discounted_tran_cnt/total_transact)
+
+write.csv(product_statistics,"product_stat")
+
+product_ori <- product_statistics
+
+product_statistics <- product_statistics[,-1]
+summary(product_statistics)
+```
+
+
+```{r}
+## k-means
+### min-max data standardization
+rescale.fun <- function(x){(x-min(x))/diff(range(x))}
+product_statistics$total_revenue <- rescale.fun(product_statistics$total_revenue)
+product_statistics$total_transact <- rescale.fun(product_statistics$total_transact)
+product_statistics$total_distinct_customer <- rescale.fun(product_statistics$total_distinct_customer)
+product_statistics$total_stores <- rescale.fun(product_statistics$total_stores)
+product_statistics$avg_discount_rate <- rescale.fun(product_statistics$avg_discount_rate)
+product_statistics$discounted_tran_cnt <- rescale.fun(product_statistics$discounted_tran_cnt)
+product_statistics$percentage_discount_product <- rescale.fun(product_statistics$percentage_discount_product)
+summary(product_statistics)
+```
+
+
+```{r}
+### use two different methods to determine the optimal value of k
+fviz_nbclust(product_statistics[, 1:7], kmeans, method = "wss", k.max = 15) +
+geom_vline(xintercept = 5, linetype = 2)  # a measure of the variability of the observations within each cluster
+fviz_nbclust(product_statistics[, 1:7], kmeans, method = "silhouette", k.max = 15)# a measure of how similar an object is to its own cluster
+```
+
+```{r}
+### set different random seed and fit model for several times to find the steady one, check the outcome of the model
+set.seed(4) 
+clusters <- kmeans(product_statistics[, 1:7], 5)
+str(clusters)
+clusters$centers
+table(clusters$cluster)
+```
+
+```{r}
+### assign cluster number back to the original data set
+product_statistics$cluster <- clusters$cluster
+product_ori$cluster <- clusters$cluster
+```
+
+```{r}
+# examine the proportion of the products of a category in each cluster
+prod_all <- product_ori %>% inner_join(product, by = "prod_id")
+prod_all <- prod_all %>% group_by(category_desc_eng) %>% mutate(num_prod_category = n())
+category_prop <- prod_all %>% group_by(category_desc_eng, cluster) %>% summarise(count = n())
+
+category_num <- unique(prod_all %>% select(category_desc_eng, num_prod_category))
+category_prop <- category_prop %>% left_join(category_num, by = "category_desc_eng")
+category_prop <- category_prop %>% mutate(proportion = count / num_prod_category)
+cluster_5_cat <- category_prop %>% filter(cluster==5) %>% select(category_desc_eng, proportion)
+cluster_4_cat <- category_prop %>% filter(cluster==4) %>% select(category_desc_eng, proportion)
+cluster_3_cat <- category_prop %>% filter(cluster==3) %>% select(category_desc_eng, proportion)
+cluster_2_cat <- category_prop %>% filter(cluster==2) %>% select(category_desc_eng, proportion)
+cluster_1_cat <- category_prop %>% filter(cluster==1) %>% select(category_desc_eng, proportion)
+```
+
+
+
+
+
+
+
