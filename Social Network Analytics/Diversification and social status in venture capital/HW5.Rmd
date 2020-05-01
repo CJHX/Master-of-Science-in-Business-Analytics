@@ -1,0 +1,284 @@
+---
+title: "Homework 5"
+author: "Carl Xi"
+date: "12/05/2019"
+output: html_document
+---
+
+```{r}
+#Initial Setup
+options(warn = -1)
+#Let's clean the workspace and import the necessary libraries
+rm(list = ls(all = TRUE))
+library(igraph)
+library(Matrix)
+library(gdata)
+library(proxy)
+library(plm)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(zoo)
+library(stringr)
+library(hhi)
+
+#let's set the working directory
+setwd("C:/Users/carlj/OneDrive/Documents/School-MSBA/Classes/Fall/Social Network Analytics/Assignment 5")
+
+#Import all the datasets
+CompanyDetailsRaw <- fread("company_details.csv", header = TRUE)
+DealDetailsRaw <- fread("deal_details.csv", header = TRUE)
+InvestorDetailsRaw <- fread("investor_details.csv", header = TRUE)
+InvestorsDealsRaw <- fread("investors_and_deals.csv", header = TRUE)
+
+#We only care about Venture Capital data from the investors dataset, so let's only keep that
+InvestorDetailsRaw <- InvestorDetailsRaw[which(InvestorDetailsRaw$Investor_Type=="Venture Capital"),]
+
+#Let's remove all Deals without a deal date
+DealDetailsRaw <- DealDetailsRaw[which(DealDetailsRaw$Deal_Date!=""),]
+
+#transform date into year
+DealDetailsRaw$Year <- as.integer(str_sub(DealDetailsRaw$Deal_Date,-2))
+
+#This small function converts the date string which is only 1-2 digits into the full 4-digit format
+Yearify <- function(twodigityear){
+  #Basically all numbers below 18 (2000-2018) gets added 2000, and everythign else gets added 1900
+  if(twodigityear<=18){
+    twodigityear = twodigityear+2000
+  }
+  else{
+    twodigityear = twodigityear+1900
+  }
+  return(twodigityear)
+}
+
+#Applying the Yearify Function Above
+DealDetailsRaw$Year <- sapply(DealDetailsRaw$Year,Yearify)
+
+#We only need to consider deals that occured after 1990, so let's only keep that
+DealDetailsRaw <- DealDetailsRaw[which(DealDetailsRaw$Year>=1990),]
+
+#We will be working with the Primary_Industry_Sector column, so let's remove all NAs there
+CompanyDetailsRaw <- CompanyDetailsRaw[!is.na(CompanyDetailsRaw$Primary_Industry_Code),]
+
+#We will be merging the investor and deal datasets later, so let's change the name of the deal column
+names(DealDetailsRaw)[1] <- "Deal_Id"
+
+#Let's make sure to only include the deals that we have company information on by checking the company ID
+DealDetailsRaw <- DealDetailsRaw[which(DealDetailsRaw$CompanyId %in% CompanyDetailsRaw$CompanyID),]
+
+#We will repeat the three steps above to our investors dataset. Let's only include investors with deals that we have information on by checking the deal IDs
+InvestorsDealsRaw <- InvestorsDealsRaw[which(InvestorsDealsRaw$Deal_Id%in%DealDetailsRaw$Deal_Id),]
+
+#Let's adjust the Investor ID column header for easier retrieval later on
+names(InvestorDetailsRaw)[1] <- "Investor_Id"
+
+#Let's only keep the investors that we have deal information on
+InvestorsDealsRaw <- InvestorsDealsRaw[which(InvestorsDealsRaw$Investor_Id%in%InvestorDetailsRaw$Investor_Id),]
+
+
+#With data prepared and cleaned, we can now make the CoInvesDealLeadCountComb matrix by merging deal year information with investor/deal data. Let's first make sure that there are no missing rows in the lead_investor column
+unique(InvestorsDealsRaw$Lead_Investor)
+
+#Let's create a clean and smaller dataset for our analysis by extracting only the columns we need and merging on deal_id
+CleanData1 <- merge(InvestorsDealsRaw[,c(1,2,4)],DealDetailsRaw[,c(1,32)],by="Deal_Id") 
+```
+
+```{r}
+#With data prepared and cleaned, we can now create the incidence matrix
+
+#Since we only care about co-investments, let's first find the number of investors in each deal
+CleanDataSubset1 <- CleanData1 %>% group_by(Deal_Id) %>% summarise(count=length(unique(Investor_Id)))
+
+#Using our number of investors list, we can now subset only the deals with 2 or more investors
+CleanDataSubset2 <- CleanDataSubset1[which(CleanDataSubset1$count>1),]
+
+#With criterias ready, we can now subset our data to keep only what we need
+CleanDatav2 <- CleanData1[which(CleanData1$Deal_Id%in%CleanDataSubset2$Deal_Id),]
+
+#While we now have only co-investments, not all co-investments have a lead investor. 
+CILI <- CleanDatav2 %>% group_by(Deal_Id)%>%  summarise(sum=sum(Lead_Investor))
+CILI2 <- CILI[which(CILI$sum>0),]
+
+#We created a list of all the unique years in our data
+YearData <- sort(unique(CleanDatav2$Year))
+```
+
+```{r}
+#We will first construct incidence matrix for co-investments, then transform it to adj matrix by year, and finally turn it into an edge list with weight and year
+
+#Due to how long storing this calculation in a list was taking, we will be using data tables instead for faster matrix multiplication 
+
+#Let's create an empty list to store our following calculations
+CombinedEdgeList <- data.table()
+
+#We Run through all the years in our dataset
+for(SelectYear in YearData){
+  #The first subset is all entries in our clean dataset of the select year
+  Subset1 <- CleanDatav2[which(CleanDatav2$Year==SelectYear),]
+  #From the first subset, we cast another matrix with investor ID on X and Deal ID on Y
+  Subset2 <- as.matrix(data.frame(dcast(Subset1[,c(1,2)], Investor_Id ~ Deal_Id, fun.aggregate=length), row.names = 1),sparse = TRUE)
+  
+  #We then take the cross product of the transpose of the two sets that we have created above
+  CombSubset <- tcrossprod(Subset2,Subset2)
+  
+  diag(CombSubset) <- 0
+  CombGraph<- graph.adjacency(CombSubset,weighted=TRUE,mode = "undirected")
+  GraphDataFrame <- get.data.frame(CombGraph)
+  GraphDataFrame$year <- SelectYear
+  CombinedEdgeList <- rbind(CombinedEdgeList,GraphDataFrame)
+}
+
+#We have to loop through all the years again, but this time we look at the number of co-investment leads in the recent 5 years
+CoInvestCount <- data.table()
+for(SelectYear in YearData){
+  Subset1 <- CombinedEdgeList[which((CombinedEdgeList$year<=SelectYear)&(CombinedEdgeList$year>SelectYear-5)),] %>% group_by(from,to) %>% summarise(year=SelectYear,count=sum(weight))
+  CoInvestCount <- rbind(CoInvestCount,as.data.frame(Subset1))
+}
+
+#We output our results to a CSV file for further processing.
+write.csv(CoInvestCount,"CoInvestCount.csv")
+
+#Let's now create the Lead Investor Edge List
+DealLeadEdgeList <- data.table()
+
+#We only want deals that are also in our co-investor Lead-Investor subset
+CoInvesLeadInvestSet <- CleanDatav2[which(CleanDatav2$Deal_Id%in%CILI2$Deal_Id),]
+CoInvesLeadInvestClean <- unique(CoInvesLeadInvestSet$Deal_Id)
+
+#We loop through each deal in the clean Co-Investment Lead-Investment dataset, selecting each deal and encoding them into the empty DealLeadEdgeList we created above
+for(SelectDeal in CoInvesLeadInvestClean){
+  Subset1 <- CoInvesLeadInvestSet[which(CoInvesLeadInvestSet$Deal_Id==SelectDeal),]
+  Subset2 <- expand.grid(unlist(Subset1[which(Subset1$Lead_Investor==1),2]),unlist(Subset1[,2]))
+  Subset2$year <- Subset1$Year
+  DealLeadEdgeList <- rbind(DealLeadEdgeList,Subset2)
+}
+
+#We make sure to set the column names right then export the data into a CSV
+colnames(DealLeadEdgeList) <- c("lead","non","year")
+write.csv(DealLeadEdgeList,"DealLeadEdgeList.csv")
+
+#Again, we repeat the same process as above and only look at the number of co-investment leads in the recent 5 years
+DealLeadCount <- data.table()
+for(SelectYear in YearData){
+  Subset1 <- DealLeadEdgeList[which((DealLeadEdgeList$year<=SelectYear)&(DealLeadEdgeList$year>SelectYear-5)),] %>% group_by(lead,non) %>% summarise(year=SelectYear,count=n())
+  DealLeadCount <- rbind(DealLeadCount,as.data.frame(Subset1))
+}
+
+#We make sure our DealLeadCount set is in the right format then export it to a CSV for further processing as above
+DealLeadCount$lead <- as.character(DealLeadCount$lead)
+DealLeadCount$non <- as.character(DealLeadCount$non)
+DealLeadCount <- DealLeadCount[which(DealLeadCount$lead!=DealLeadCount$non),]
+write.csv(DealLeadCount,"DealLeadCount.csv")
+
+#We will reconstruct the CoInvestCount but exclude all entries with the same from and to investor ID
+CoInvestCount <- CoInvestCount[which(CoInvestCount$from!=CoInvestCount$to),]
+CoInvestCountSubset <- cbind(CoInvestCount[,2],CoInvestCount[,1],CoInvestCount[,c(3,4)])
+colnames(CoInvestCountSubset) <- c("from","to","year","count")
+CoInvestCount <- rbind(CoInvestCount,CoInvestCountSubset)
+colnames(CoInvestCount) <- c("lead","non","year","countshare")
+colnames(DealLeadCount) <- c("lead","non","year","leadshare")
+
+#We can now merge the Co-Invest Count and Deal Lead Count information by lead, non, and year columns
+CoInvesDealLeadCountComb <- merge(CoInvestCount,DealLeadCount,by=c("lead","non","year"),all.x = TRUE)
+CoInvesDealLeadCountComb[which(is.na(CoInvesDealLeadCountComb$leadshare)),5] <- 0
+CoInvesDealLeadCountComb$value <- CoInvesDealLeadCountComb$leadshare/CoInvesDealLeadCountComb$countshare
+
+#We can take a subset of only the columns we need
+CIDLCountCombSubset <- CoInvesDealLeadCountComb[,c(1,2,3,5)]
+colnames(CIDLCountCombSubset)[4]<-"weight"
+
+#We create an empty datatable to store our calculations
+CombinedEigenGraph <- data.table()
+#Like above, we loop through every year, take a subset of the columns we need for each year, make a graph, calculate the 
+for(SelectYear in YearData){
+  Subset1 <- CIDLCountCombSubset[which(CIDLCountCombSubset$year==SelectYear),c(1,2,4)]
+  Subset2 <- graph.data.frame(Subset1,directed=TRUE)
+  EigenCent <- eigen_centrality(Subset2, directed = TRUE, weights = NULL)$vector
+  CombGraph <- as.data.table(cbind(names(EigenCent),unname(EigenCent)))
+  CombGraph$year <- SelectYear
+  CombinedEigenGraph <- rbind(CombinedEigenGraph,CombGraph)
+}
+
+write.csv(CombinedEigenGraph,"CombinedEigenGraph.csv")
+
+```
+
+1. a) Traditionally, venture capital analysis have only considered the concentration of a venture capital firms investments in to different portfolio categories. The more concentrated a firm’s investments, the less diversified it is. 
+
+```{r}
+#Let's first calculate the Herfindahl Index
+
+#Let's find all the unique Industries
+IndustryList <- unique(CompanyDetailsRaw$Primary_Industry_Code)
+
+#We go back to the raw data and merge company ID to our deals by the deal ID column
+CleanDataQ1 <- merge(CleanData1,DealDetailsRaw[,c(1,2)],by="Deal_Id",all.x = TRUE)
+
+#We standardize the company ID column header
+colnames(CleanDataQ1)[5]<-"CompanyID"
+
+#We then go back again and extract the primary industry code information and add it to our data
+CleanDataQ1 <- merge(CleanDataQ1,CompanyDetailsRaw[,c(1,8)],by="CompanyID",all.x = TRUE)
+
+#We group our new dataset with the two columns added by investor id, year, and finally industry code, and conduct the necessary mutation
+CleanDataQ1v2 <- CleanDataQ1 %>% group_by(Investor_Id,Year,Primary_Industry_Code) %>% summarise(count=n())%>% group_by(Investor_Id,Year) %>% mutate(Percentage=count/sum(count)*100)
+
+#We take a subset of only unique investors every year
+DataQ1Subset <- unique(CleanDataQ1v2[,c(1,2)])
+
+#We Create an empty list for the percentages
+DataQ1Subset$Percent <- NA
+
+#We then loop through each investor and calculate their index percentages
+for(i in (1:dim(DataQ1Subset)[1])){
+  Subset1 <- CleanDataQ1v2[(which((CleanDataQ1v2$Investor_Id==DataQ1Subset[i,]$Investor_Id)&(CleanDataQ1v2$Year==DataQ1Subset[i,]$Year))),c(3,5)]
+  Subset2 <- hhi(as.data.frame(Subset1),"Percentage")
+  #We encode the calculated value into the Percent column
+  DataQ1Subset[i,3] <- Subset2
+}
+
+#Again, we export the results for further analysis
+write.csv(DataQ1Subset,"DataQ1Subset.csv")
+```
+
+
+```{r}
+#This time, we are merging our subset with the index values with our eigen graph from above. We first need to make sure the column names match up
+colnames(CombinedEigenGraph) <- c("Investor_Id","score","Year")
+EigenGraphCompany <- merge(CombinedEigenGraph,DataQ1Subset,by=c("Investor_Id","Year"),all.x = TRUE)
+#After the merge, we remove all NA columns
+EigenGraphCompany <- na.omit(EigenGraphCompany)
+
+#We then group our data by investor ID and calculate the lag score
+EigenGraphCompanyv2 <- EigenGraphCompany %>% group_by(Investor_Id) %>% mutate(lag.score = dplyr::lag(score, n = 1, default = NA))
+
+#Again, we make sure to remove all NAs
+EigenGraphCompanyv2 <- na.omit(EigenGraphCompanyv2)
+```
+Run a regression predicting a venture capital firm’s concentration in a year based on its status in the prior year it made an investment and also include the square of this term. One motivation that might influence venture capital investors to diversify might be to minimize risk. In order to isolate the effect of status from this alternative rationale, include lagged control variables for a venture capital firm’s risk exposure:
+
+• whether a venture capital firm tends to originate its own deals: for more than 50% of the companies it invests in, it invests in the first investment round this company has received
+
+• whether a venture capital firm tends to invest in the IT sector: more than 50% of the companies it invests in are in the company-level variable Primary Industry Sector “Information Technology”
+
+• whether a venture capital firm tends to invest in early-stage startups: more than 50% of the companies it invests in are of the Deal Type 1 “Early Stage VC”, “Accelerator/Incubator”, “Seed Round”, or “Angel (individual)”
+
+```{r}
+#To see if the second point is true (more than 50% investments in the IT sector), we need to find the Industry of each deal in our Clean Dataset for Q1 
+CleanDataQ1 <- merge(CleanDataQ1,CompanyDetailsRaw[,c(1,6)],by="CompanyID",all.x = TRUE)
+
+#Then we group by investor, year and finally industry to calculate the percentage, this is similar to above the index calculation process above
+ITCalc <- CleanDataQ1 %>% group_by(Investor_Id,Year,Primary_Industry_Sector) %>% summarise(count=n())%>% group_by(Investor_Id,Year) %>% mutate(Percentage=count/sum(count)*100)
+
+#We are finally ready to run our first model, we first run 
+
+#Model1<-plm(Percent ~ lag.score + I(lag.score*lag.score), data = EigenGraphCompanyv2, model = "within", effect="individual",random.method="amemiya")
+
+#This was suppuosed to work but I ran into the following problem:
+#Error in plm.fit(data, model, effect, random.method, random.models, random.dfcor, : 0 (non-NA) cases"
+#Did not have time to debug
+
+#I will re-submit my assignment with more questions completed hopefully soon.
+```
+
