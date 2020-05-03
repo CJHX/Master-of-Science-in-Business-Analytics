@@ -1,0 +1,32 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2511
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww10800\viewh8400\viewkind0
+\deftab720
+\pard\pardeftab720\ri0\partightenfactor0
+
+\f0\fs23 \cf0 hadoop fs -mkdir petexchange\
+\
+CREATE DATABASE petexchange;\
+\
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardeftab720\ri0\sl-380\partightenfactor0
+\cf0 mysql --user=training --password=training petexchange < petsexchange.out\
+\pard\pardeftab720\ri0\partightenfactor0
+\cf0 sqoop import \\\
+--connect jdbc:mysql://localhost/petexchange \\\
+--username training --password training \\\
+--fields-terminated-by '\\t' \\\
+--warehouse-dir /petexchange \\\
+--table posts \\\
+--columns "Id, PostTypeId, AcceptedAnswerId, ParentId, CreationDate, DeletionDate, Score, ViewCount, OwnerUserId, OwnerDisplayName, LastEditorUserId, LastEditorDisplayName, LastEditDate, LastActivityDate, Title, Tags, AnswerCount, CommentCount, FavoriteCount, ClosedDate, CommunityOwnedDate"\
+\
+hadoop dfs -ls /petexchange/posts\
+\
+mkdir petexchange\
+\
+hdfs dfs -cat /petexchange/posts/part-m-00000 | head -25 > petexchange/posts\uc0\u8232 \
+cat petexchange/posts\
+\
+ls ~/petexchange\
+}
